@@ -124,7 +124,12 @@ export function d1SessionStore(db: D1Database, options: D1SessionStoreOptions = 
       const sidHash = await sha256Hex(sid);
       const row = await readRow(sidHash);
       if (!row) return null;
-      if (revocation && (await revocation.isRevoked(sidHash))) return null;
+      if (
+        revocation &&
+        (await revocation.isRevoked({ sidHash, userId: row.user_id, createdAt: row.created_at }))
+      ) {
+        return null;
+      }
 
       const at = now();
       if (at >= row.idle_expires_at || at >= row.absolute_expires_at) {
@@ -159,26 +164,32 @@ export function d1SessionStore(db: D1Database, options: D1SessionStoreOptions = 
       await db.prepare(`DELETE FROM ${table} WHERE sid_hash = ?1`).bind(sidHash).run();
     },
 
+    /**
+     * D1 is strongly consistent, so a single DELETE is authoritative — no
+     * enumeration hazard, and no revocation list required.
+     */
     async revokeAllForUser(userId: string): Promise<void> {
       if (revocation) {
-        const rows = await db
-          .prepare(`SELECT sid_hash, absolute_expires_at FROM ${table} WHERE user_id = ?1`)
-          .bind(userId)
-          .all<Pick<Row, 'sid_hash' | 'absolute_expires_at'>>();
-        await revocation.revokeMany(
-          rows.results.map((r) => ({ sidHash: r.sid_hash, expiresAt: r.absolute_expires_at })),
-        );
+        // Only relevant when the list is shared with another store.
+        await revocation.revokeUser(userId, now() + 1);
       }
       await db.prepare(`DELETE FROM ${table} WHERE user_id = ?1`).bind(userId).run();
     },
 
+    /**
+     * Two DELETEs instead of one `OR`-joined statement: an `OR` across two
+     * columns can't use either index for a seek, so it degrades to a full
+     * table scan as the table grows. Each half here is a plain indexed range
+     * delete. A session already removed by the first statement is silently
+     * skipped by the second.
+     */
     async cleanup(at?: number): Promise<number> {
       const cutoff = at ?? now();
-      const result = await db
-        .prepare(`DELETE FROM ${table} WHERE absolute_expires_at <= ?1 OR idle_expires_at <= ?1`)
-        .bind(cutoff)
-        .run();
-      return result.meta.changes ?? 0;
+      const [byAbsolute, byIdle] = await db.batch<unknown>([
+        db.prepare(`DELETE FROM ${table} WHERE absolute_expires_at <= ?1`).bind(cutoff),
+        db.prepare(`DELETE FROM ${table} WHERE idle_expires_at <= ?1`).bind(cutoff),
+      ]);
+      return (byAbsolute?.meta.changes ?? 0) + (byIdle?.meta.changes ?? 0);
     },
   };
 }

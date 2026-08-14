@@ -36,12 +36,24 @@ export type NeonAuthOptions = {
   audience: string | string[];
   /** Allowed signature algorithms. Default: RS256 / ES256 / EdDSA. */
   algorithms?: JwsAlgorithm[];
-  /** Leeway for exp/nbf, in seconds. Default: 5. */
+  /**
+   * Leeway for exp/nbf, in seconds. Default: 60.
+   *
+   * Zero tolerance turns ordinary clock drift between the issuer and the edge
+   * into sporadic 401s that are miserable to diagnose. 60s is the usual choice
+   * and costs a minute of extra validity on an already short-lived token.
+   */
   clockToleranceSec?: number;
   /** How long a fetched JWKS stays fresh. Default: 600s. */
   jwksCacheTtlSec?: number;
   /** Minimum gap between JWKS network fetches. Default: 60s. */
   minRefetchIntervalSec?: number;
+  /** Abort a JWKS fetch after this long. Default: 3000ms. */
+  fetchTimeoutMs?: number;
+  /** Reject a JWKS document larger than this. Default: 262144 (256KB). */
+  maxJwksBytes?: number;
+  /** Reject a JWKS document with more keys than this. Default: 32. */
+  maxJwksKeys?: number;
   /** Second-tier JWKS cache, shared across isolates. */
   cache?: { kv: KVNamespace; keyPrefix?: string };
   /** Override how the bearer token is located. Default: `Authorization: Bearer`. */
@@ -229,9 +241,12 @@ export function neonAuth(options: NeonAuthOptions): AuthProvider {
     issuer,
     audience,
     algorithms = DEFAULT_ALGORITHMS,
-    clockToleranceSec = 5,
+    clockToleranceSec = 60,
     jwksCacheTtlSec = 600,
     minRefetchIntervalSec = 60,
+    fetchTimeoutMs = 3000,
+    maxJwksBytes = 256 * 1024,
+    maxJwksKeys = 32,
     cache,
     getToken = defaultGetToken,
     fetchImpl,
@@ -257,12 +272,41 @@ export function neonAuth(options: NeonAuthOptions): AuthProvider {
     if (entry.inflight) return entry.inflight;
     const inflight = (async () => {
       entry.lastAttemptAt = clock();
-      const res = await doFetch(jwksUrl, { headers: { accept: 'application/json' } });
+
+      // A hung or oversized JWKS endpoint must not become an outage here: no
+      // timeout means every authenticated request waits on it, and an unbounded
+      // body means it can exhaust the isolate.
+      const init: { headers: Record<string, string>; signal?: AbortSignal } = {
+        headers: { accept: 'application/json' },
+      };
+      if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+        init.signal = AbortSignal.timeout(fetchTimeoutMs);
+      }
+
+      const res = await doFetch(jwksUrl, init);
       if (!res.ok) throw new Error(`jwks fetch failed: ${res.status}`);
-      const body = (await res.json()) as { keys?: unknown };
+
+      const contentType = res.headers.get('content-type') ?? '';
+      if (!contentType.includes('json')) {
+        throw new Error(`jwks fetch returned ${contentType || 'no content-type'}`);
+      }
+      const declaredLength = Number(res.headers.get('content-length') ?? '0');
+      if (declaredLength > maxJwksBytes) {
+        throw new Error(`jwks document too large: ${declaredLength} bytes`);
+      }
+
+      const text = await res.text();
+      if (text.length > maxJwksBytes) {
+        throw new Error(`jwks document too large: ${text.length} bytes`);
+      }
+
+      const body = JSON.parse(text) as { keys?: unknown };
       const keys = Array.isArray(body.keys)
         ? (body.keys.filter((k) => typeof k === 'object' && k !== null) as Jwk[])
         : [];
+      if (keys.length > maxJwksKeys) {
+        throw new Error(`jwks document has too many keys: ${keys.length}`);
+      }
       entry.keys = keys;
       entry.fetchedAt = clock();
       entry.imported.clear();

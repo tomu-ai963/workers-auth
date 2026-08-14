@@ -20,8 +20,12 @@ export type SessionScope = {
 export type Session = {
   /**
    * The raw session id. NEVER persisted — the store only ever holds
-   * `sha256(sid)`. It exists on this object solely so the caller can put it in
-   * a cookie right after `create()`.
+   * `sha256(sid)`.
+   *
+   * It exists on this object solely so the caller can put it in a cookie right
+   * after `create()`. It is stripped before the session reaches application
+   * code (see {@link SessionInfo}), so there is no route by which it can be
+   * logged or serialised into a response by accident.
    */
   sid: string;
   userId: string;
@@ -37,6 +41,12 @@ export type Session = {
   scope?: SessionScope;
   meta?: Record<string, unknown>;
 };
+
+/**
+ * A session as application code sees it: everything except the credential.
+ * This is what `c.get('authSession')` holds.
+ */
+export type SessionInfo = Omit<Session, 'sid'>;
 
 export type NewSession = {
   userId: string;
@@ -54,21 +64,48 @@ export interface SessionStore {
   get(sid: string): Promise<Session | null>;
   create(input: NewSession): Promise<Session>;
   revoke(sid: string): Promise<void>;
+  /**
+   * Revokes every session of a user.
+   *
+   * Implementations that cannot guarantee this MUST throw rather than do it
+   * partially — a "log out everywhere" that silently misses a session is worse
+   * than one that refuses to run. `kvSessionStore` throws unless a
+   * {@link RevocationList} is attached.
+   */
   revokeAllForUser(userId: string): Promise<void>;
   /** Extends only the idle window. Absolute expiry is never moved. */
   touch(sid: string, idleExpiresAt: number): Promise<void>;
 }
 
+/** Everything needed to decide whether a session has been revoked. */
+export type RevocationQuery = {
+  /** `sha256(sid)` hex. Raw session ids never reach the revocation list. */
+  sidHash: string;
+  /** Checked against the user-level revocation marker. */
+  userId: string;
+  /** Session creation time (epoch ms), compared to `revoked_before`. */
+  createdAt: number;
+};
+
 /**
- * Immediate-revocation side channel for eventually-consistent primary stores
- * (i.e. KV). Keys are `sha256(sid)` hex — raw session ids never reach it.
+ * Strongly-consistent revocation side channel for stores that cannot revoke
+ * reliably on their own (i.e. KV).
+ *
+ * It answers two questions in one round trip: was *this* session revoked, and
+ * was *every* session of this user revoked before it was created.
  */
 export interface RevocationList {
-  isRevoked(sidHash: string): Promise<boolean>;
+  isRevoked(query: RevocationQuery): Promise<boolean>;
   /** `expiresAt` is the original session's absolute expiry (epoch ms). */
   revoke(sidHash: string, expiresAt: number): Promise<void>;
   revokeMany(entries: Array<{ sidHash: string; expiresAt: number }>): Promise<void>;
-  /** Deletes tombstones whose original session would have expired anyway. */
+  /**
+   * Invalidates every session of `userId` created before `revokedBefore`
+   * (epoch ms). Unlike per-session tombstones this needs no enumeration, so it
+   * cannot miss a session that a listing has not caught up with yet.
+   */
+  revokeUser(userId: string, revokedBefore: number): Promise<void>;
+  /** Deletes records that can no longer affect any live session. */
   cleanup(now?: number): Promise<number>;
 }
 
@@ -89,6 +126,13 @@ export type AuthUser = {
 
 export interface AuthProvider {
   readonly name: string;
+  /**
+   * Set when the provider reads its credential out of the URL. Such providers
+   * may only be listed in `callbackProviders`; `createAuth` throws if one shows
+   * up in `providers`, because a URL-borne credential must not be accepted on
+   * every route.
+   */
+  readonly callbackOnly?: boolean;
   /**
    * Returns the verified subject, or null when this provider does not apply /
    * cannot verify. Must not throw for "bad credentials" — null is the answer.

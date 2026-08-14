@@ -137,6 +137,18 @@ describe('neonAuth', () => {
     expect(await provider.verify(bearer(fresh), env)).not.toBeNull();
   });
 
+  it('defaults to a 60 second clock-skew tolerance', async () => {
+    const { fetchImpl } = jwksFetch([rsaKey.jwk]);
+    const provider = neonAuth({ jwksUrl: freshUrl(), issuer: ISSUER, audience: AUDIENCE, fetchImpl, clock });
+
+    // The issuer's clock is 45s ahead of ours: exp already looks past on paper.
+    const skewed = await signJwt(rsaKey, claims({ exp: nowSec() - 45 }));
+    expect(await provider.verify(bearer(skewed), env)).not.toBeNull();
+
+    const tooOld = await signJwt(rsaKey, claims({ exp: nowSec() - 90 }));
+    expect(await provider.verify(bearer(tooOld), env)).toBeNull();
+  });
+
   it('rejects a token that is not valid yet', async () => {
     const { fetchImpl } = jwksFetch([rsaKey.jwk]);
     const provider = neonAuth({
@@ -278,6 +290,91 @@ describe('neonAuth', () => {
     state.keys = [rsaKey.jwk, rotated.jwk];
     expect(await provider.verify(bearer(rotatedToken), env)).not.toBeNull();
     expect(state.calls).toBe(3);
+  });
+
+  it('aborts a JWKS fetch that hangs past the timeout', async () => {
+    const hanging = (async (_url: unknown, init: { signal?: AbortSignal }) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      });
+    }) as unknown as typeof fetch;
+
+    const provider = neonAuth({
+      jwksUrl: freshUrl(),
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      fetchImpl: hanging,
+      fetchTimeoutMs: 20,
+      clock,
+    });
+    const token = await signJwt(rsaKey, claims());
+    expect(await provider.verify(bearer(token), env)).toBeNull();
+  });
+
+  it('rejects a JWKS document declared larger than the byte limit', async () => {
+    const oversized = (async () =>
+      new Response(JSON.stringify({ keys: [rsaKey.jwk] }), {
+        headers: { 'content-type': 'application/json', 'content-length': String(10 * 1024 * 1024) },
+      })) as unknown as typeof fetch;
+
+    const provider = neonAuth({
+      jwksUrl: freshUrl(),
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      fetchImpl: oversized,
+      maxJwksBytes: 1024,
+      clock,
+    });
+    const token = await signJwt(rsaKey, claims());
+    expect(await provider.verify(bearer(token), env)).toBeNull();
+  });
+
+  it('rejects a JWKS body that is actually larger than the byte limit', async () => {
+    // No Content-Length this time: the actual body size must be checked too.
+    const padded = (async () =>
+      new Response(JSON.stringify({ keys: [rsaKey.jwk], padding: 'x'.repeat(5000) }), {
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof fetch;
+
+    const provider = neonAuth({
+      jwksUrl: freshUrl(),
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      fetchImpl: padded,
+      maxJwksBytes: 1024,
+      clock,
+    });
+    const token = await signJwt(rsaKey, claims());
+    expect(await provider.verify(bearer(token), env)).toBeNull();
+  });
+
+  it('rejects a JWKS document with too many keys', async () => {
+    const manyKeys = Array.from({ length: 40 }, (_v, i) => ({ ...rsaKey.jwk, kid: `k${i}` }));
+    const { fetchImpl } = jwksFetch(manyKeys);
+    const provider = neonAuth({
+      jwksUrl: freshUrl(),
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      fetchImpl,
+      maxJwksKeys: 32,
+      clock,
+    });
+    const token = await signJwt(rsaKey, claims());
+    expect(await provider.verify(bearer(token), env)).toBeNull();
+  });
+
+  it('rejects a non-JSON JWKS response', async () => {
+    const html = (async () =>
+      new Response('<html>not json</html>', { headers: { 'content-type': 'text/html' } })) as unknown as typeof fetch;
+    const provider = neonAuth({
+      jwksUrl: freshUrl(),
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      fetchImpl: html,
+      clock,
+    });
+    const token = await signJwt(rsaKey, claims());
+    expect(await provider.verify(bearer(token), env)).toBeNull();
   });
 
   it('shares the JWKS through KV across isolates', async () => {

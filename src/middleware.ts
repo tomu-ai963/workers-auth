@@ -6,12 +6,14 @@ import type { Context, MiddlewareHandler, Next } from 'hono';
 
 import { parseCookies, serializeCookie, serializeCookieDeletion, type ResolvedCookieConfig } from './cookie.js';
 import { issueCsrfToken, verifyCsrf } from './csrf.js';
+import { applyNoStore } from './headers.js';
 import type {
   AuthUser,
   Clock,
   CsrfConfig,
   AuthProvider,
   Session,
+  SessionInfo,
   SessionStore,
   SubjectType,
 } from './types.js';
@@ -24,10 +26,34 @@ declare module 'hono' {
      * use {@link getOptionalUser} there.
      */
     user: AuthUser;
-    /** The cookie session, or null when the subject authenticated by bearer. */
-    authSession: Session | null;
+    /**
+     * The cookie session minus its credential, or null when the subject
+     * authenticated by bearer. The raw `sid` is deliberately absent: it must
+     * not be reachable from application code, where one `c.json(session)` or
+     * log line would leak it.
+     */
+    authSession: SessionInfo | null;
   }
 }
+
+/** Drops the credential before a session is handed to application code. */
+export function toSessionInfo(session: Session): SessionInfo {
+  const { sid: _sid, ...info } = session;
+  return info;
+}
+
+/**
+ * Namespace for the fields the SDK itself keeps in `Session.meta`. Application
+ * metadata lives alongside it and can never collide with — or be mistaken for —
+ * an authenticated attribute.
+ */
+export const AUTH_META_KEY = '__auth';
+
+export type AuthMeta = {
+  email?: string;
+  provider?: string;
+  claims?: Record<string, unknown>;
+};
 
 export type ResolvedSessionConfig = {
   idleTtlSec: number;
@@ -37,6 +63,8 @@ export type ResolvedSessionConfig = {
 
 export type ResolvedAuthConfig = {
   providers: AuthProvider[];
+  /** Consulted only by `GET /callback`. May hold `callbackOnly` providers. */
+  callbackProviders: AuthProvider[];
   store: SessionStore;
   cookie: ResolvedCookieConfig;
   session: ResolvedSessionConfig;
@@ -75,20 +103,35 @@ export function getOptionalUser(c: Context): AuthUser | undefined {
   return c.get('user') as AuthUser | undefined;
 }
 
-export function getSession(c: Context): Session | null {
-  return (c.get('authSession') as Session | null | undefined) ?? null;
+export function getSession(c: Context): SessionInfo | null {
+  return (c.get('authSession') as SessionInfo | null | undefined) ?? null;
 }
 
-export function sessionToUser(session: Session): AuthUser {
-  const meta = (session.meta ?? {}) as { email?: unknown; claims?: unknown; provider?: unknown };
-  const claims = (meta.claims && typeof meta.claims === 'object' ? meta.claims : {}) as Record<string, unknown>;
+/**
+ * Rebuilds the subject from a session record.
+ *
+ * Only the SDK's own `meta.__auth` namespace is consulted. Application metadata
+ * sitting next to it can never be promoted into an authenticated attribute,
+ * however it happens to be named.
+ */
+export function sessionToUser(session: Session | SessionInfo): AuthUser {
+  const namespaced = (session.meta ?? {})[AUTH_META_KEY];
+  const auth = (typeof namespaced === 'object' && namespaced !== null ? namespaced : {}) as {
+    email?: unknown;
+    provider?: unknown;
+    claims?: unknown;
+  };
+  const claims = (auth.claims && typeof auth.claims === 'object' ? auth.claims : {}) as Record<
+    string,
+    unknown
+  >;
   return {
     id: session.userId,
     subjectType: session.subjectType,
-    ...(typeof meta.email === 'string' ? { email: meta.email } : {}),
+    ...(typeof auth.email === 'string' ? { email: auth.email } : {}),
     claims: {
       ...claims,
-      ...(typeof meta.provider === 'string' ? { provider: meta.provider } : {}),
+      ...(typeof auth.provider === 'string' ? { provider: auth.provider } : {}),
     },
   };
 }
@@ -218,6 +261,7 @@ export function createMiddleware(
     });
     if (!csrf.ok) {
       config.onEvent({ type: 'csrf.failed', reason: csrf.reason });
+      applyNoStore(c);
       return c.json({ error: 'csrf_failed' as const }, 403);
     }
 
@@ -227,11 +271,12 @@ export function createMiddleware(
         return next();
       }
       config.onEvent({ type: 'auth.failed', reason: 'no_credentials' });
+      applyNoStore(c);
       return c.json(unauthorizedBody(), 401);
     }
 
     c.set('user', user);
-    c.set('authSession', session);
+    c.set('authSession', session ? toSessionInfo(session) : null);
 
     if (session) {
       const at = config.clock();

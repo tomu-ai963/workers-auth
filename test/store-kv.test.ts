@@ -14,7 +14,7 @@ let now = 1_700_000_000_000;
 const clock = () => now;
 
 function makeStore(extra: Parameters<typeof kvSessionStore>[1] = {}): SessionStore {
-  return kvSessionStore(env.KV, { clock, ...extra });
+  return kvSessionStore(env.KV, { clock, touchThrottleSec: 0, ...extra });
 }
 
 const NEW_SESSION = {
@@ -23,6 +23,38 @@ const NEW_SESSION = {
   idleTtlSec: 7 * DAY,
   absoluteTtlSec: 30 * DAY,
 };
+
+/**
+ * KV wrapper that can hold a `put` open, so a request already in flight can be
+ * made to land its write after another request has finished.
+ */
+function gatedKv(kv: KVNamespace) {
+  let gate: Promise<void> | null = null;
+  let open: (() => void) | null = null;
+  const call = (name: 'get' | 'put' | 'delete' | 'list', args: unknown[]) =>
+    (kv[name] as never as (...x: unknown[]) => unknown)(...args);
+
+  return {
+    kv: {
+      get: (...a: unknown[]) => call('get', a),
+      list: (...a: unknown[]) => call('list', a),
+      delete: (...a: unknown[]) => call('delete', a),
+      put: async (...a: unknown[]) => {
+        if (gate) await gate;
+        return call('put', a);
+      },
+    } as unknown as KVNamespace,
+    hold() {
+      gate = new Promise<void>((r) => {
+        open = r;
+      });
+    },
+    release() {
+      open?.();
+      gate = null;
+    },
+  };
+}
 
 beforeEach(async () => {
   now = 1_700_000_000_000;
@@ -55,38 +87,32 @@ describe('kvSessionStore', () => {
     expect(await store.get(created.sid)).toBeNull();
   });
 
-  it('never writes the raw session id to the store', async () => {
+  it('never writes the raw session id to any key or value', async () => {
     const store = makeStore();
     const created = await store.create(NEW_SESSION);
+    await store.touch(created.sid, now + 7 * DAY * 1000);
 
-    const hashedKey = `sess:${await sha256Hex(created.sid)}`;
-    const stored = await env.KV.get(hashedKey);
-    expect(stored).not.toBeNull();
-    expect(stored).not.toContain(created.sid);
+    const hash = await sha256Hex(created.sid);
+    const { keys } = await env.KV.list();
+    expect(keys.map((k) => k.name).sort()).toEqual([`seen:${hash}`, `sess:${hash}`]);
 
-    const { keys } = await env.KV.list({ prefix: 'sess:' });
-    expect(keys.map((k) => k.name)).toEqual([hashedKey]);
+    for (const key of keys) {
+      expect(key.name).not.toContain(created.sid);
+      expect((await env.KV.get(key.name)) ?? '').not.toContain(created.sid);
+    }
+  });
+
+  it('writes one key per login (no reverse index)', async () => {
+    const store = makeStore();
+    await store.create(NEW_SESSION);
+    const { keys } = await env.KV.list();
+    expect(keys).toHaveLength(1);
+    expect(keys[0]?.name.startsWith('sess:')).toBe(true);
   });
 
   it('returns null for an unknown session id', async () => {
     const store = makeStore();
     expect(await store.get('not-a-real-session-id')).toBeNull();
-  });
-
-  it('revokes every session of one user and leaves others alone', async () => {
-    const store = makeStore();
-    const a1 = await store.create(NEW_SESSION);
-    const a2 = await store.create(NEW_SESSION);
-    const b1 = await store.create({ ...NEW_SESSION, userId: 'user_2' });
-
-    await store.revokeAllForUser('user_1');
-
-    expect(await store.get(a1.sid)).toBeNull();
-    expect(await store.get(a2.sid)).toBeNull();
-    expect(await store.get(b1.sid)).not.toBeNull();
-
-    const index = await env.KV.list({ prefix: 'uidx:user_1:' });
-    expect(index.keys).toHaveLength(0);
   });
 
   it('expires at the absolute deadline even while active', async () => {
@@ -111,6 +137,14 @@ describe('kvSessionStore', () => {
     expect(await store.get(created.sid)).toBeNull();
   });
 
+  it('derives the first idle window from createdAt when nothing has touched it', async () => {
+    const store = makeStore();
+    const created = await store.create(NEW_SESSION);
+    const fetched = await store.get(created.sid);
+    expect(fetched?.idleExpiresAt).toBe(created.createdAt + 7 * DAY * 1000);
+    expect(fetched?.lastSeenAt).toBe(created.createdAt);
+  });
+
   it('refuses to push the idle window past the absolute one', async () => {
     const store = makeStore();
     const created = await store.create(NEW_SESSION);
@@ -122,64 +156,184 @@ describe('kvSessionStore', () => {
 
   it('rejects sessions without both TTLs', async () => {
     const store = makeStore();
-    await expect(
-      store.create({ ...NEW_SESSION, idleTtlSec: 0 }),
-    ).rejects.toThrow(/idleTtlSec/);
-    await expect(
-      store.create({ ...NEW_SESSION, absoluteTtlSec: Number.NaN }),
-    ).rejects.toThrow(/absoluteTtlSec/);
+    await expect(store.create({ ...NEW_SESSION, idleTtlSec: 0 })).rejects.toThrow(/idleTtlSec/);
+    await expect(store.create({ ...NEW_SESSION, absoluteTtlSec: Number.NaN })).rejects.toThrow(
+      /absoluteTtlSec/,
+    );
   });
 
-  describe('with a revocation list', () => {
-    it('rejects a revoked session immediately', async () => {
-      const store = makeStore({ revocation: revocationList(env.DB, { clock }) });
-      const created = await store.create(NEW_SESSION);
-      expect(await store.get(created.sid)).not.toBeNull();
+  it('throttles idle-marker writes to protect the KV per-key write limit', async () => {
+    const store = kvSessionStore(env.KV, { clock, touchThrottleSec: 10 });
+    const created = await store.create(NEW_SESSION);
 
-      await store.revoke(created.sid);
-      expect(await store.get(created.sid)).toBeNull();
-    });
+    now += 1000;
+    await store.touch(created.sid, now + 7 * DAY * 1000);
+    const first = (await store.get(created.sid))?.lastSeenAt;
 
-    it('still rejects when a stale KV replica serves the deleted record', async () => {
-      const revocation = revocationList(env.DB, { clock });
-      const store = makeStore({ revocation });
-      const created = await store.create(NEW_SESSION);
+    now += 1000; // inside the throttle window: the write is skipped
+    await store.touch(created.sid, now + 7 * DAY * 1000);
+    expect((await store.get(created.sid))?.lastSeenAt).toBe(first);
 
-      const key = `sess:${await sha256Hex(created.sid)}`;
-      const raw = (await env.KV.get(key)) as string;
+    now += 10_000; // past it
+    await store.touch(created.sid, now + 7 * DAY * 1000);
+    expect((await store.get(created.sid))?.lastSeenAt).toBe(now);
+  });
+});
 
-      await store.revoke(created.sid);
-      // Simulate KV eventual consistency: the record reappears.
-      await env.KV.put(key, raw, { expirationTtl: 60 });
+/** Regression: an in-flight request used to be able to undo a logout. */
+describe('kvSessionStore: revoke cannot be undone by a concurrent touch', () => {
+  it('keeps a revoked session dead when a touch lands afterwards', async () => {
+    const g = gatedKv(env.KV);
+    const store = kvSessionStore(g.kv, { clock, touchThrottleSec: 0 });
+    const created = await store.create(NEW_SESSION);
 
-      expect(await store.get(created.sid)).toBeNull();
-    });
+    // Request A is mid-touch: its write is pending.
+    g.hold();
+    const inflight = store.touch(created.sid, now + 7 * DAY * 1000);
+    await new Promise((r) => setTimeout(r, 0));
 
-    it('tombstones every session on revokeAllForUser', async () => {
-      const revocation = revocationList(env.DB, { clock });
-      const store = makeStore({ revocation });
-      const s1 = await store.create(NEW_SESSION);
-      const s2 = await store.create(NEW_SESSION);
+    // Request B logs the user out and completes.
+    await store.revoke(created.sid);
+    expect(await store.get(created.sid)).toBeNull();
 
-      const keys = await Promise.all([sha256Hex(s1.sid), sha256Hex(s2.sid)]);
-      const raws = await Promise.all(keys.map((k) => env.KV.get(`sess:${k}`) as Promise<string>));
+    // Request A's write now lands. It must not bring the session back.
+    g.release();
+    await inflight;
 
-      await store.revokeAllForUser('user_1');
-      await Promise.all(keys.map((k, i) => env.KV.put(`sess:${k}`, raws[i] as string, { expirationTtl: 60 })));
+    expect(await store.get(created.sid)).toBeNull();
+  });
 
-      expect(await store.get(s1.sid)).toBeNull();
-      expect(await store.get(s2.sid)).toBeNull();
-    });
+  it('holds even when the touch is the very first write for that session', async () => {
+    const g = gatedKv(env.KV);
+    const store = kvSessionStore(g.kv, { clock, touchThrottleSec: 0 });
+    const created = await store.create(NEW_SESSION);
 
-    it('drops tombstones once the underlying session would have expired', async () => {
-      const revocation = revocationList(env.DB, { clock });
-      const store = makeStore({ revocation });
-      const created = await store.create(NEW_SESSION);
-      await store.revoke(created.sid);
+    g.hold();
+    const inflight = store.touch(created.sid, now + 30 * DAY * 1000);
+    await new Promise((r) => setTimeout(r, 0));
+    await store.revoke(created.sid);
+    g.release();
+    await inflight;
 
-      expect(await revocation.cleanup()).toBe(0);
-      now = created.absoluteExpiresAt + 1;
-      expect(await revocation.cleanup()).toBe(1);
-    });
+    expect(await store.get(created.sid)).toBeNull();
+    // The stray marker is inert; only the record grants access.
+    const stray = await env.KV.get(`seen:${await sha256Hex(created.sid)}`);
+    expect(stray).not.toBeNull();
+    expect(await store.get(created.sid)).toBeNull();
+  });
+
+  it('leaves the session record untouched across touches', async () => {
+    const store = makeStore();
+    const created = await store.create(NEW_SESSION);
+    const key = `sess:${await sha256Hex(created.sid)}`;
+    const before = await env.KV.get(key);
+
+    now += HOUR * 1000;
+    await store.touch(created.sid, now + 7 * DAY * 1000);
+
+    expect(await env.KV.get(key)).toBe(before);
+  });
+});
+
+describe('kvSessionStore: revokeAllForUser', () => {
+  it('refuses to run without a revocation list instead of half working', async () => {
+    const store = makeStore();
+    await store.create(NEW_SESSION);
+    await expect(store.revokeAllForUser('user_1')).rejects.toThrow(/requires a revocation list/);
+  });
+
+  it('invalidates every session of the user, and only that user', async () => {
+    const store = makeStore({ revocation: revocationList(env.DB, { clock }) });
+    const a1 = await store.create(NEW_SESSION);
+    const a2 = await store.create(NEW_SESSION);
+    const b1 = await store.create({ ...NEW_SESSION, userId: 'user_2' });
+
+    await store.revokeAllForUser('user_1');
+
+    expect(await store.get(a1.sid)).toBeNull();
+    expect(await store.get(a2.sid)).toBeNull();
+    expect(await store.get(b1.sid)).not.toBeNull();
+  });
+
+  /**
+   * Regression: the old implementation swept an eventually-consistent
+   * `uidx:` listing, so a session missing from the listing survived.
+   */
+  it('does not depend on any listing being up to date', async () => {
+    const store = makeStore({ revocation: revocationList(env.DB, { clock }) });
+    const created = await store.create(NEW_SESSION);
+
+    const listed = await env.KV.list();
+    expect(listed.keys.some((k) => k.name.startsWith('uidx:'))).toBe(false);
+
+    await store.revokeAllForUser('user_1');
+    expect(await store.get(created.sid)).toBeNull();
+  });
+
+  it('catches a session created in the same millisecond as the revocation', async () => {
+    const store = makeStore({ revocation: revocationList(env.DB, { clock }) });
+    const created = await store.create(NEW_SESSION);
+    // Clock does not advance: createdAt === revocation time.
+    await store.revokeAllForUser('user_1');
+    expect(await store.get(created.sid)).toBeNull();
+  });
+
+  it('lets a session created after the revocation through', async () => {
+    const store = makeStore({ revocation: revocationList(env.DB, { clock }) });
+    await store.revokeAllForUser('user_1');
+
+    now += 1;
+    const fresh = await store.create(NEW_SESSION);
+    expect(await store.get(fresh.sid)).not.toBeNull();
+  });
+});
+
+describe('kvSessionStore: single-session revocation list', () => {
+  it('rejects a revoked session immediately', async () => {
+    const store = makeStore({ revocation: revocationList(env.DB, { clock }) });
+    const created = await store.create(NEW_SESSION);
+    expect(await store.get(created.sid)).not.toBeNull();
+
+    await store.revoke(created.sid);
+    expect(await store.get(created.sid)).toBeNull();
+  });
+
+  it('still rejects when a stale KV replica serves the deleted record', async () => {
+    const store = makeStore({ revocation: revocationList(env.DB, { clock }) });
+    const created = await store.create(NEW_SESSION);
+
+    const key = `sess:${await sha256Hex(created.sid)}`;
+    const raw = (await env.KV.get(key)) as string;
+
+    await store.revoke(created.sid);
+    await env.KV.put(key, raw, { expirationTtl: 60 });
+
+    expect(await store.get(created.sid)).toBeNull();
+  });
+
+  it('drops tombstones once the underlying session would have expired', async () => {
+    const revocation = revocationList(env.DB, { clock });
+    const store = makeStore({ revocation });
+    const created = await store.create(NEW_SESSION);
+    await store.revoke(created.sid);
+
+    expect(await revocation.cleanup()).toBe(0);
+    now = created.absoluteExpiresAt + 1;
+    expect(await revocation.cleanup()).toBe(1);
+  });
+
+  it('keeps user markers until no session could predate them', async () => {
+    const revocation = revocationList(env.DB, { clock, maxSessionLifetimeSec: 30 * DAY });
+    const store = makeStore({ revocation });
+    const created = await store.create(NEW_SESSION);
+    await store.revokeAllForUser('user_1');
+
+    // A premature cleanup would un-revoke the session.
+    now += 29 * DAY * 1000;
+    expect(await revocation.cleanup()).toBe(0);
+    expect(await store.get(created.sid)).toBeNull();
+
+    now += 2 * DAY * 1000;
+    expect(await revocation.cleanup()).toBe(1);
   });
 });

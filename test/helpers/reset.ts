@@ -1,6 +1,12 @@
 import { env } from 'cloudflare:test';
 
-const TABLES = ['auth_sessions', 'auth_revocations', 'auth_magic_link_tokens', 'auth_api_keys'];
+const TABLES = [
+  'auth_sessions',
+  'auth_revocations',
+  'auth_user_revocations',
+  'auth_magic_link_tokens',
+  'auth_api_keys',
+];
 
 /**
  * Storage is shared across tests in this pool, so every test that asserts on

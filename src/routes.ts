@@ -1,24 +1,28 @@
 /**
- * The three endpoints `auth.routes()` mounts, plus session creation.
+ * The endpoints `auth.routes()` mounts, plus session creation.
  *
  *   POST /session   verify credentials -> mint session -> set cookies
- *   GET  /session   current session (401 when there is none)
+ *   GET  /session   the current cookie session (401 when there is none)
  *   POST /logout    revoke + clear cookies
- *   GET  /callback  magic-link landing: verify token -> mint session -> redirect
+ *   GET  /callback  magic-link landing -> mint session -> redirect
+ *                   (mounted only when `callbackProviders` is non-empty)
  */
 
 import { Hono, type Context } from 'hono';
 
 import { fingerprint } from './crypto.js';
 import { verifyCsrf } from './csrf.js';
+import { applyNoStore } from './headers.js';
 import {
+  AUTH_META_KEY,
   clearSessionCookies,
   issueCsrfToken,
   readCookieSession,
-  resolveRequestAuth,
+  sessionToUser,
   setSessionCookies,
   unauthorizedBody,
   verifyProviders,
+  type AuthMeta,
   type ResolvedAuthConfig,
 } from './middleware.js';
 import type { AuthUser, Session } from './types.js';
@@ -52,8 +56,13 @@ export async function createSessionFor(
     await config.store.revoke(previous.sid);
   }
 
-  const meta: Record<string, unknown> = {
-    ...(options.meta ?? {}),
+  if (options.meta && AUTH_META_KEY in options.meta) {
+    throw new TypeError(
+      `createSession: "${AUTH_META_KEY}" is reserved for the SDK; put application metadata under another key`,
+    );
+  }
+
+  const authMeta: AuthMeta = {
     ...(user.email ? { email: user.email } : {}),
     ...(typeof user.claims['provider'] === 'string' ? { provider: user.claims['provider'] } : {}),
     ...(config.storeUserClaims ? { claims: user.claims } : {}),
@@ -65,7 +74,7 @@ export async function createSessionFor(
     idleTtlSec: config.session.idleTtlSec,
     absoluteTtlSec: config.session.absoluteTtlSec,
     ...(options.scope ? { scope: options.scope } : {}),
-    meta,
+    meta: { ...(options.meta ?? {}), [AUTH_META_KEY]: authMeta },
   });
 
   const maxAgeSec = Math.max(1, Math.ceil((session.absoluteExpiresAt - config.clock()) / 1000));
@@ -105,6 +114,12 @@ export function safeRedirectPath(candidate: string | null | undefined, fallback:
 export function createRoutes(config: ResolvedAuthConfig): Hono {
   const app = new Hono();
 
+  // Identity responses must never be stored by anything downstream.
+  app.use('*', async (c, next) => {
+    applyNoStore(c);
+    await next();
+  });
+
   app.post('/session', async (c) => {
     const current = await readCookieSession(c, config);
 
@@ -130,10 +145,15 @@ export function createRoutes(config: ResolvedAuthConfig): Hono {
     return c.json({ ok: true as const, user, session: publicSession(session) });
   });
 
+  /**
+   * Reports the cookie session and nothing else. Providers are deliberately not
+   * run here: verification can have side effects (a magic-link token is
+   * single-use), and a GET must not consume a credential.
+   */
   app.get('/session', async (c) => {
-    const { user, session } = await resolveRequestAuth(c, config);
-    if (!user) return c.json(unauthorizedBody(), 401);
-    return c.json({ user, session: session ? publicSession(session) : null });
+    const { session } = await readCookieSession(c, config);
+    if (!session) return c.json(unauthorizedBody(), 401);
+    return c.json({ user: sessionToUser(session), session: publicSession(session) });
   });
 
   app.post('/logout', async (c) => {
@@ -164,16 +184,25 @@ export function createRoutes(config: ResolvedAuthConfig): Hono {
     return c.json({ ok: true as const });
   });
 
-  app.get('/callback', async (c) => {
-    const user = await verifyProviders(config.providers, c.req.raw, c.env, config.onEvent);
-    if (!user) {
-      config.onEvent({ type: 'auth.failed', reason: 'callback_rejected' });
-      return c.json(unauthorizedBody(), 401);
-    }
-    await createSessionFor(c, config, user);
-    const target = safeRedirectPath(c.req.query('redirect_to'), config.callbackRedirect);
-    return c.redirect(target, 302);
-  });
+  // Only mounted when the caller opted into a URL-borne credential. Without
+  // that, there is no landing route to burn a token on.
+  if (config.callbackProviders.length > 0) {
+    app.get('/callback', async (c) => {
+      const user = await verifyProviders(
+        config.callbackProviders,
+        c.req.raw,
+        c.env,
+        config.onEvent,
+      );
+      if (!user) {
+        config.onEvent({ type: 'auth.failed', reason: 'callback_rejected' });
+        return c.json(unauthorizedBody(), 401);
+      }
+      await createSessionFor(c, config, user);
+      const target = safeRedirectPath(c.req.query('redirect_to'), config.callbackRedirect);
+      return c.redirect(target, 302);
+    });
+  }
 
   return app;
 }

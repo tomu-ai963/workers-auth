@@ -75,6 +75,13 @@ describe('cookie serialization', () => {
     expect(header.startsWith('__Host-session=a%3Bb%20c;')).toBe(true);
   });
 
+  it('rejects a path or domain carrying CRLF or other control characters', () => {
+    expect(() => serializeCookie('session', 'v', { path: '/x\r\nSet-Cookie: evil=1' })).toThrow();
+    expect(() =>
+      serializeCookie('session', 'v', { domain: 'example.com\r\nSet-Cookie: evil=1' }),
+    ).toThrow();
+  });
+
   it('deletes with Max-Age=0', () => {
     expect(serializeCookieDeletion('__Host-session')).toContain('Max-Age=0');
   });

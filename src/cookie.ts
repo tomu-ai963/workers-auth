@@ -69,6 +69,16 @@ export function resolveCookieConfig(config: CookieConfig = {}): ResolvedCookieCo
   };
 }
 
+/**
+ * `path` and `domain` are the two attributes written into the header
+ * verbatim, unlike `value` which goes through `encodeURIComponent`. Every
+ * caller inside this SDK only ever passes `'/'` and no domain, so this only
+ * matters for a caller of the public `serializeCookie` API — but a control
+ * character there would let it inject arbitrary header lines, so it is
+ * rejected rather than trusted.
+ */
+const HEADER_SAFE_RE = /^[^\x00-\x1f\x7f;]*$/;
+
 export function serializeCookie(name: string, value: string, attrs: CookieAttributes = {}): string {
   if (!TOKEN_RE.test(name.replace(/^__(Host|Secure)-/, ''))) {
     throw new TypeError(`serializeCookie: invalid cookie name ${JSON.stringify(name)}`);
@@ -77,6 +87,9 @@ export function serializeCookie(name: string, value: string, attrs: CookieAttrib
   const parts = [`${name}=${encoded}`];
 
   const path = attrs.path ?? '/';
+  if (!HEADER_SAFE_RE.test(path)) {
+    throw new TypeError(`serializeCookie: invalid path ${JSON.stringify(path)}`);
+  }
   parts.push(`Path=${path}`);
 
   if (attrs.maxAge !== undefined) {
@@ -84,7 +97,12 @@ export function serializeCookie(name: string, value: string, attrs: CookieAttrib
     parts.push(`Max-Age=${maxAge}`);
     parts.push(`Expires=${new Date(Date.now() + maxAge * 1000).toUTCString()}`);
   }
-  if (attrs.domain) parts.push(`Domain=${attrs.domain}`);
+  if (attrs.domain) {
+    if (!HEADER_SAFE_RE.test(attrs.domain)) {
+      throw new TypeError(`serializeCookie: invalid domain ${JSON.stringify(attrs.domain)}`);
+    }
+    parts.push(`Domain=${attrs.domain}`);
+  }
   if (attrs.httpOnly !== false) parts.push('HttpOnly');
   if (attrs.secure !== false) parts.push('Secure');
   parts.push(`SameSite=${attrs.sameSite ?? 'Lax'}`);

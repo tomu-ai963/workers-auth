@@ -162,4 +162,26 @@ describe('api key format', () => {
     await apiKey({ store, clock, trackLastUsed: true }).verify(withKey(issued.key), env);
     expect((await store.findById(issued.keyId))?.lastUsedAt).toBe(now);
   });
+
+  it('kv store tracks last use too', async () => {
+    const store = kvApiKeyStore(env.KV, { clock });
+    const issued = await issueApiKey({ store, env: 'live', subjectId: 'svc_1', clock });
+
+    now += 5_000;
+    await apiKey({ store, clock, trackLastUsed: true }).verify(withKey(issued.key), env);
+    expect((await store.findById(issued.keyId))?.lastUsedAt).toBe(now);
+  });
+
+  it('kv store: a stray touch write after revoke does not undo the revocation', async () => {
+    // Revocation and last-used tracking live in separate keys precisely so
+    // this can't happen — this is the regression test for that split.
+    const store = kvApiKeyStore(env.KV, { clock });
+    const issued = await issueApiKey({ store, env: 'live', subjectId: 'svc_1', clock });
+
+    await store.revoke(issued.keyId);
+    await store.touch?.(issued.keyId, now + 1000);
+
+    expect((await store.findById(issued.keyId))?.revokedAt).not.toBeNull();
+    expect(await apiKey({ store, clock }).verify(withKey(issued.key), env)).toBeNull();
+  });
 });

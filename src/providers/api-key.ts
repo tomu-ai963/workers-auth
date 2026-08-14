@@ -53,21 +53,44 @@ export function parseApiKey(value: string): ParsedApiKey | null {
 // Stores
 // ---------------------------------------------------------------------------
 
-export type KvApiKeyStoreOptions = { prefix?: string };
+export type KvApiKeyStoreOptions = { prefix?: string; clock?: Clock };
 
+/**
+ * Revocation lives in its own key, written blind (no read first). This is the
+ * same split used by `kvSessionStore` for the same reason: a read-modify-write
+ * on the whole record would let a `touch()` race a `revoke()` and, on an
+ * unlucky interleaving, overwrite the revocation. Since `revoke()` never reads
+ * the record, there is nothing left for it to race.
+ *
+ * `touch()` still does a read-modify-write on the core record, but the fields
+ * involved (`lastUsedAt`) are not security-relevant — a lost update there is
+ * imprecise telemetry, not a wrongly-accepted key.
+ */
 export function kvApiKeyStore(kv: KVNamespace, options: KvApiKeyStoreOptions = {}): ApiKeyStore {
   const prefix = options.prefix ?? 'apikey:';
+  const now: Clock = options.clock ?? Date.now;
+  const recordKey = (keyId: string) => `${prefix}${keyId}`;
+  const revokedKey = (keyId: string) => `${prefix}revoked:${keyId}`;
+
   return {
     async findById(keyId) {
-      return (await kv.get<ApiKeyRecord>(`${prefix}${keyId}`, 'json')) ?? null;
+      const [record, revokedAt] = await Promise.all([
+        kv.get<ApiKeyRecord>(recordKey(keyId), 'json'),
+        kv.get(revokedKey(keyId)),
+      ]);
+      if (!record) return null;
+      return revokedAt ? { ...record, revokedAt: Number(revokedAt) } : record;
     },
     async put(record) {
-      await kv.put(`${prefix}${record.keyId}`, JSON.stringify(record));
+      await kv.put(recordKey(record.keyId), JSON.stringify(record));
     },
     async revoke(keyId) {
-      const existing = await kv.get<ApiKeyRecord>(`${prefix}${keyId}`, 'json');
+      await kv.put(revokedKey(keyId), String(now()));
+    },
+    async touch(keyId, at) {
+      const existing = await kv.get<ApiKeyRecord>(recordKey(keyId), 'json');
       if (!existing) return;
-      await kv.put(`${prefix}${keyId}`, JSON.stringify({ ...existing, revokedAt: Date.now() }));
+      await kv.put(recordKey(keyId), JSON.stringify({ ...existing, lastUsedAt: at }));
     },
   };
 }

@@ -2,8 +2,8 @@ import { env } from 'cloudflare:test';
 import { Hono } from 'hono';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import { createAuth, getOptionalUser, getUser, type CreateAuthOptions } from '../src/index.js';
-import { kvMagicLinkStore, magicLink } from '../src/providers/magic-link.js';
+import { createAuth, getOptionalUser, getSession, getUser, type CreateAuthOptions } from '../src/index.js';
+import { d1MagicLinkStore, magicLink } from '../src/providers/magic-link.js';
 import { kvSessionStore } from '../src/store/kv.js';
 import type { AuthProvider, AuthUser } from '../src/types.js';
 import { resetStorage } from './helpers/reset.js';
@@ -39,7 +39,19 @@ function build(overrides: Partial<CreateAuthOptions> = {}) {
   app.route('/auth', auth.routes());
   app.get('/api/me', (c) => c.json(getUser(c)));
   app.post('/api/things', (c) => c.json({ created: true }));
+  app.get('/api/session-view', (c) => c.json({ session: getSession(c) }));
   app.get('/open/who', (c) => c.json({ user: getOptionalUser(c) ?? null }));
+
+  // Lets a test drive `auth.createSession` with application-supplied metadata.
+  app.post('/test/login', async (c) => {
+    const meta = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    await auth.createSession(
+      c,
+      { id: 'user_x', subjectType: 'user', claims: {} },
+      { meta },
+    );
+    return c.json({ ok: true });
+  });
 
   return { app, auth };
 }
@@ -390,17 +402,27 @@ describe('POST /logout', () => {
   });
 });
 
+function magicLinkSetup() {
+  const sent: string[] = [];
+  const provider = magicLink({
+    store: d1MagicLinkStore(env.DB, { clock }),
+    sendToken: async (_email, token) => {
+      sent.push(token);
+    },
+    allowTokenInQuery: true,
+    clock,
+  });
+  return { provider, sent, last: () => sent[sent.length - 1] as string };
+}
+
 describe('GET /callback', () => {
   it('mints a session from a magic-link token and redirects', async () => {
-    const sent: string[] = [];
-    const provider = magicLink({
-      store: kvMagicLinkStore(env.KV, { clock }),
-      sendToken: async (_email, token) => {
-        sent.push(token);
-      },
-      clock,
+    const { provider, sent } = magicLinkSetup();
+    const { app } = build({
+      providers: [],
+      callbackProviders: [provider],
+      callbackRedirect: '/dashboard',
     });
-    const { app } = build({ providers: [provider], callbackRedirect: '/dashboard' });
     await provider.start('user@example.com');
 
     const res = await app.fetch(new Request(`${ORIGIN}/auth/callback?token=${sent[0] as string}`));
@@ -415,21 +437,13 @@ describe('GET /callback', () => {
   });
 
   it('never redirects off-origin', async () => {
-    const sent: string[] = [];
-    const provider = magicLink({
-      store: kvMagicLinkStore(env.KV, { clock }),
-      sendToken: async (_email, token) => {
-        sent.push(token);
-      },
-      clock,
-    });
-    const { app } = build({ providers: [provider] });
+    const { provider, last } = magicLinkSetup();
+    const { app } = build({ providers: [], callbackProviders: [provider] });
 
     for (const target of ['https://evil.example.com/', '//evil.example.com/', '/\\evil.example.com']) {
       await provider.start('user@example.com');
-      const token = sent[sent.length - 1] as string;
       const res = await app.fetch(
-        new Request(`${ORIGIN}/auth/callback?token=${token}&redirect_to=${encodeURIComponent(target)}`),
+        new Request(`${ORIGIN}/auth/callback?token=${last()}&redirect_to=${encodeURIComponent(target)}`),
       );
       expect(res.status).toBe(302);
       expect(res.headers.get('location')).toBe('/');
@@ -437,13 +451,136 @@ describe('GET /callback', () => {
   });
 
   it('rejects a bad token', async () => {
-    const { app } = build({
-      providers: [
-        magicLink({ store: kvMagicLinkStore(env.KV, { clock }), sendToken: async () => {}, clock }),
-      ],
-    });
+    const { provider } = magicLinkSetup();
+    const { app } = build({ providers: [], callbackProviders: [provider] });
     const res = await app.fetch(new Request(`${ORIGIN}/auth/callback?token=nope`));
     expect(res.status).toBe(401);
+  });
+
+  it('is not mounted at all without callbackProviders', async () => {
+    const { app } = build();
+    const res = await app.fetch(new Request(`${ORIGIN}/auth/callback?token=whatever`));
+    expect(res.status).toBe(404);
+  });
+});
+
+/**
+ * Regression: a magic-link token used to be readable from `?token=` by every
+ * provider run, so any route both accepted it and consumed it.
+ */
+describe('URL-borne credentials are confined to /callback', () => {
+  it('refuses a query token on GET /auth/session and leaves it unspent', async () => {
+    const { provider, sent } = magicLinkSetup();
+    const { app } = build({ providers: [], callbackProviders: [provider] });
+    await provider.start('victim@example.com');
+    const token = sent[0] as string;
+
+    const probe = await app.fetch(new Request(`${ORIGIN}/auth/session?token=${token}`));
+    expect(probe.status).toBe(401);
+
+    // The real link still works afterwards.
+    const login = await app.fetch(new Request(`${ORIGIN}/auth/callback?token=${token}`));
+    expect(login.status).toBe(302);
+  });
+
+  it('refuses a query token on an application route and leaves it unspent', async () => {
+    const { provider, sent } = magicLinkSetup();
+    const { app } = build({ providers: [], callbackProviders: [provider] });
+    await provider.start('victim@example.com');
+    const token = sent[0] as string;
+
+    const probe = await app.fetch(new Request(`${ORIGIN}/api/me?token=${token}`));
+    expect(probe.status).toBe(401);
+
+    const login = await app.fetch(new Request(`${ORIGIN}/auth/callback?token=${token}`));
+    expect(login.status).toBe(302);
+  });
+
+  it('refuses to register a URL-reading provider on every route', () => {
+    const { provider } = magicLinkSetup();
+    expect(() => build({ providers: [provider] })).toThrow(/callbackProviders/);
+  });
+});
+
+describe('auth responses are never cacheable', () => {
+  it('marks every route and every rejection no-store', async () => {
+    const { app } = build();
+    const jar = await login(app);
+
+    const responses = [
+      await app.fetch(new Request(`${ORIGIN}/auth/session`, { headers: { cookie: cookieHeader(jar) } })),
+      await app.fetch(new Request(`${ORIGIN}/auth/session`)),
+      await app.fetch(
+        new Request(`${ORIGIN}/auth/session`, {
+          method: 'POST',
+          headers: { origin: ORIGIN, 'x-test-user': 'user_1' },
+        }),
+      ),
+      await app.fetch(new Request(`${ORIGIN}/auth/logout`, { method: 'POST' })),
+      await app.fetch(new Request(`${ORIGIN}/api/me`)),
+      await app.fetch(
+        new Request(`${ORIGIN}/api/things`, {
+          method: 'POST',
+          headers: { origin: ORIGIN, cookie: cookieHeader(jar) },
+        }),
+      ),
+    ];
+
+    for (const res of responses) {
+      expect(res.headers.get('cache-control')).toBe('no-store, private');
+      expect(res.headers.get('vary')).toBe('Cookie, Authorization');
+    }
+    // The last two are the middleware's own 401 / 403.
+    expect(responses[4]?.status).toBe(401);
+    expect(responses[5]?.status).toBe(403);
+  });
+});
+
+/** Regression: `c.get('authSession').sid` used to expose the raw credential. */
+describe('the raw session id never reaches application code', () => {
+  it('strips sid from the context session', async () => {
+    const { app } = build();
+    const jar = await login(app);
+
+    const res = await app.fetch(
+      new Request(`${ORIGIN}/api/session-view`, { headers: { cookie: cookieHeader(jar) } }),
+    );
+    const body = (await res.json()) as { session: Record<string, unknown> };
+    expect(body.session.userId).toBe('user_1');
+    expect('sid' in body.session).toBe(false);
+    expect(JSON.stringify(body)).not.toContain(jar.session as string);
+  });
+});
+
+describe('createSession meta namespace', () => {
+  it('rejects application metadata that collides with the reserved key', async () => {
+    const { app } = build();
+    const res = await app.fetch(
+      new Request(`${ORIGIN}/test/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ __auth: { email: 'attacker@evil.com' } }),
+      }),
+    );
+    expect(res.status).toBe(500);
+  });
+
+  it('does not let application metadata promote itself into an authenticated attribute', async () => {
+    const { app } = build();
+    const res = await app.fetch(
+      new Request(`${ORIGIN}/test/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: 'spoofed@evil.com', provider: 'spoofed' }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const jar = readCookies(res);
+
+    const me = await app.fetch(new Request(`${ORIGIN}/api/me`, { headers: { cookie: cookieHeader(jar) } }));
+    const user = (await me.json()) as AuthUser;
+    expect(user.email).toBeUndefined();
+    expect(user.claims['provider']).toBeUndefined();
   });
 });
 

@@ -30,8 +30,18 @@ import type {
 } from './types.js';
 
 export type CreateAuthOptions = {
-  /** Tried in order; the first success wins. */
+  /**
+   * Tried in order on every request; the first success wins. A provider that
+   * reads its credential from the URL (`callbackOnly`) is rejected here.
+   */
   providers: AuthProvider[];
+  /**
+   * Consulted only by `GET /callback`. This is where a magic-link provider
+   * configured with `allowTokenInQuery` belongs, so that `?token=` is honoured
+   * on exactly one route instead of all of them. `GET /callback` is not mounted
+   * at all when this is empty.
+   */
+  callbackProviders?: AuthProvider[];
   store: SessionStore;
   cookie?: CookieConfig;
   /**
@@ -100,6 +110,20 @@ export function createAuth(options: CreateAuthOptions): Auth {
   if (!Array.isArray(options.providers)) {
     throw new TypeError('createAuth: providers must be an array');
   }
+  const callbackProviders = options.callbackProviders ?? [];
+  if (!Array.isArray(callbackProviders)) {
+    throw new TypeError('createAuth: callbackProviders must be an array');
+  }
+  // A provider that reads `?token=` would otherwise authenticate — and consume
+  // the token on — every route the middleware covers.
+  const misplaced = options.providers.find((p) => p.callbackOnly === true);
+  if (misplaced) {
+    throw new TypeError(
+      `createAuth: provider "${misplaced.name}" reads its credential from the URL and must be ` +
+        'listed in callbackProviders, not providers (a URL-borne token must not authenticate ' +
+        'every route).',
+    );
+  }
   if (!options.store || typeof options.store.get !== 'function') {
     throw new TypeError('createAuth: a SessionStore is required');
   }
@@ -111,6 +135,7 @@ export function createAuth(options: CreateAuthOptions): Auth {
 
   const config: ResolvedAuthConfig = {
     providers: options.providers,
+    callbackProviders,
     store: options.store,
     cookie: resolveCookieConfig(options.cookie),
     session: resolveSessionConfig(options.session),
@@ -155,27 +180,34 @@ export type {
   CsrfConfig,
   NewSession,
   RevocationList,
+  RevocationQuery,
   Session,
   SessionConfig,
+  SessionInfo,
   SessionScope,
   SessionStore,
   SubjectType,
 } from './types.js';
 
 export {
+  AUTH_META_KEY,
   getOptionalUser,
   getSession,
   getUser,
   readCookieSession,
   resolveRequestAuth,
   sessionToUser,
+  toSessionInfo,
   verifyProviders,
   type AuthEvent,
+  type AuthMeta,
   type MiddlewareOptions,
   type ResolvedAuthConfig,
 } from './middleware.js';
 
 export { createRoutes, createSessionFor, safeRedirectPath, type CreateSessionOptions } from './routes.js';
+
+export { applyNoStore, AUTH_VARY, NO_STORE } from './headers.js';
 
 export {
   getCookie,

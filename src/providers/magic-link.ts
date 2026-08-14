@@ -19,7 +19,22 @@ export type MagicLinkRecord = {
   expiresAt: number;
 };
 
+/** Optional on `MagicLinkStore`; only `d1MagicLinkStore` implements it. */
+export interface MagicLinkStoreCleanup {
+  /** Deletes expired, never-consumed tokens. Returns the number removed. */
+  cleanup(now?: number): Promise<number>;
+}
+
 export interface MagicLinkStore {
+  /**
+   * Whether `take()` is a single indivisible operation.
+   *
+   * This is the entire security property of a magic link. A store that reads
+   * and then deletes — however consistent the underlying storage — lets two
+   * concurrent requests both observe the same token, so the link is replayable.
+   * `magicLink()` refuses a store that reports `false`.
+   */
+  readonly atomicTake: boolean;
   put(tokenHash: string, record: MagicLinkRecord): Promise<void>;
   /** Consume the token. Must delete it, whether or not it turns out to be valid. */
   take(tokenHash: string): Promise<MagicLinkRecord | null>;
@@ -32,9 +47,16 @@ export interface MagicLinkStore {
 export type KvMagicLinkStoreOptions = { prefix?: string; clock?: Clock };
 
 /**
- * KV token store. Convenient, but KV has no atomic read-and-delete: two
- * requests that race on the same token can both observe it. Use
- * {@link d1MagicLinkStore} when strict single-use matters.
+ * KV token store — REPLAYABLE, and `magicLink()` rejects it by default.
+ *
+ * KV has no atomic read-and-delete, so `take()` is a `get` followed by a
+ * `delete`. Two requests that arrive together both see the token and both log
+ * in; this is a plain interleaving, not an eventual-consistency artefact, and
+ * it reproduces on a strongly consistent local emulator. An email scanner that
+ * pre-fetches the link, a double click, or an attacker racing the victim all
+ * trigger it.
+ *
+ * Use {@link d1MagicLinkStore}.
  */
 export function kvMagicLinkStore(
   kv: KVNamespace,
@@ -44,6 +66,7 @@ export function kvMagicLinkStore(
   const now: Clock = options.clock ?? Date.now;
 
   return {
+    atomicTake: false,
     async put(tokenHash, record) {
       const ttl = Math.max(60, Math.ceil((record.expiresAt - now()) / 1000));
       await kv.put(`${prefix}${tokenHash}`, JSON.stringify(record), { expirationTtl: ttl });
@@ -59,11 +82,15 @@ export function kvMagicLinkStore(
 
 export type D1MagicLinkStoreOptions = { table?: string; clock?: Clock };
 
-/** D1 token store. `DELETE ... RETURNING` makes single-use atomic. */
+/**
+ * D1 token store. `DELETE ... RETURNING` is one statement: the row is removed
+ * and returned indivisibly, so exactly one of two racing requests can get it.
+ * That — not D1's consistency model — is what makes single use hold.
+ */
 export function d1MagicLinkStore(
   db: D1Database,
   options: D1MagicLinkStoreOptions = {},
-): MagicLinkStore {
+): MagicLinkStore & MagicLinkStoreCleanup {
   const table = options.table ?? 'auth_magic_link_tokens';
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
     throw new TypeError(`d1MagicLinkStore.table: ${JSON.stringify(table)} is not a valid SQL identifier`);
@@ -71,6 +98,7 @@ export function d1MagicLinkStore(
   const now: Clock = options.clock ?? Date.now;
 
   return {
+    atomicTake: true,
     async put(tokenHash, record) {
       await db
         .prepare(
@@ -85,6 +113,18 @@ export function d1MagicLinkStore(
         .bind(tokenHash)
         .first<{ email: string; expires_at: number }>();
       return row ? { email: row.email, expiresAt: row.expires_at } : null;
+    },
+    /**
+     * Only expired tokens ever accumulate here: a consumed one is deleted by
+     * `take()` in the same statement that reads it. Safe to run from a cron
+     * trigger.
+     */
+    async cleanup(at?: number): Promise<number> {
+      const result = await db
+        .prepare(`DELETE FROM ${table} WHERE expires_at <= ?1`)
+        .bind(at ?? now())
+        .run();
+      return result.meta.changes ?? 0;
     },
   };
 }
@@ -103,6 +143,22 @@ export type MagicLinkOptions = {
   sendToken: (email: string, token: string) => Promise<void>;
   /** Token lifetime. Default: 900 (15 minutes). */
   ttlSec?: number;
+  /**
+   * Read the token from `?token=` as well as from the header and body.
+   *
+   * A URL-borne credential leaks through Referer headers, browser history,
+   * access logs and shared inboxes, so a provider configured this way is
+   * marked `callbackOnly` and may only be listed in `callbackProviders` —
+   * `createAuth()` throws if it appears in `providers`. That is what stops
+   * `GET /api/anything?token=…` from authenticating, and stops an arbitrary
+   * request from burning the token.
+   */
+  allowTokenInQuery?: boolean;
+  /**
+   * Accept a store whose `take()` is not atomic, making links replayable.
+   * There is no good reason to set this outside a throwaway prototype.
+   */
+  dangerouslyAllowReplayableTokens?: boolean;
   /** Where to find the token on an incoming request. */
   getToken?: (req: Request) => string | null | Promise<string | null>;
   /** Map a verified address to your own user record. Default: id = email. */
@@ -131,24 +187,32 @@ function looksLikeEmail(email: string): boolean {
   return email.length > 2 && email.length <= MAX_EMAIL_LENGTH && /^[^\s@]+@[^\s@.]+\.[^\s@]+$/.test(email);
 }
 
-async function defaultGetToken(req: Request): Promise<string | null> {
-  const url = new URL(req.url);
-  const fromQuery = url.searchParams.get('token');
-  if (fromQuery) return fromQuery;
-
-  const fromHeader = req.headers.get('x-magic-token');
-  if (fromHeader) return fromHeader;
-
-  const contentType = req.headers.get('content-type') ?? '';
-  if (contentType.includes('application/json')) {
-    try {
-      const body = (await req.clone().json()) as { token?: unknown };
-      if (body && typeof body.token === 'string') return body.token;
-    } catch {
-      return null;
+/**
+ * Header and body only. Reading `?token=` is opt-in via `allowTokenInQuery`,
+ * because a token in the URL would otherwise be honoured — and consumed — by
+ * every route the provider is mounted on.
+ */
+function makeGetToken(allowQuery: boolean) {
+  return async function getToken(req: Request): Promise<string | null> {
+    if (allowQuery) {
+      const fromQuery = new URL(req.url).searchParams.get('token');
+      if (fromQuery) return fromQuery;
     }
-  }
-  return null;
+
+    const fromHeader = req.headers.get('x-magic-token');
+    if (fromHeader) return fromHeader;
+
+    const contentType = req.headers.get('content-type') ?? '';
+    if (contentType.includes('application/json')) {
+      try {
+        const body = (await req.clone().json()) as { token?: unknown };
+        if (body && typeof body.token === 'string') return body.token;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
 }
 
 export function magicLink(options: MagicLinkOptions): MagicLinkProvider {
@@ -156,7 +220,9 @@ export function magicLink(options: MagicLinkOptions): MagicLinkProvider {
     store,
     sendToken,
     ttlSec = 900,
-    getToken = defaultGetToken,
+    allowTokenInQuery = false,
+    dangerouslyAllowReplayableTokens = false,
+    getToken = makeGetToken(allowTokenInQuery),
     resolveUser,
     onSendError,
     clock = Date.now,
@@ -169,9 +235,20 @@ export function magicLink(options: MagicLinkOptions): MagicLinkProvider {
   if (!Number.isFinite(ttlSec) || ttlSec <= 0) {
     throw new TypeError('magicLink: ttlSec must be a positive number of seconds');
   }
+  if (!store || typeof store.take !== 'function') {
+    throw new TypeError('magicLink: a MagicLinkStore is required');
+  }
+  if (!store.atomicTake && !dangerouslyAllowReplayableTokens) {
+    throw new TypeError(
+      'magicLink: this store cannot consume a token atomically, so its links are replayable — ' +
+        'two concurrent requests can both log in with the same token. Use d1MagicLinkStore(), ' +
+        'or set dangerouslyAllowReplayableTokens: true if you genuinely accept that.',
+    );
+  }
 
   return {
     name,
+    callbackOnly: allowTokenInQuery,
 
     async start(rawEmail: string): Promise<{ ok: true }> {
       const email = normalizeEmail(String(rawEmail ?? ''));

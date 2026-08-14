@@ -131,7 +131,20 @@ describe('d1SessionStore', () => {
     const created = await store.create(NEW_SESSION);
 
     await store.revoke(created.sid);
-    expect(await revocation.isRevoked(await sha256Hex(created.sid))).toBe(true);
+    expect(
+      await revocation.isRevoked({
+        sidHash: await sha256Hex(created.sid),
+        userId: created.userId,
+        createdAt: created.createdAt,
+      }),
+    ).toBe(true);
+    expect(await store.get(created.sid)).toBeNull();
+  });
+
+  it('revokes all sessions of a user without needing a revocation list', async () => {
+    const store = d1SessionStore(env.DB, { clock });
+    const created = await store.create(NEW_SESSION);
+    await store.revokeAllForUser('user_1');
     expect(await store.get(created.sid)).toBeNull();
   });
 });

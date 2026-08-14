@@ -18,3 +18,6 @@ CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id
 
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_absolute_expires_at
   ON auth_sessions (absolute_expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_idle_expires_at
+  ON auth_sessions (idle_expires_at);
