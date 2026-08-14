@@ -1,0 +1,71 @@
+{
+  "name": "@tomu-ai/workers-auth",
+  "version": "0.1.0",
+  "description": "Lightweight, secure auth session SDK for Cloudflare Workers + Hono. Thin client, server-held state, zero runtime dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "migrations",
+    "README.md",
+    "SECURITY.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./neon": {
+      "types": "./dist/neon.d.ts",
+      "import": "./dist/neon.js"
+    },
+    "./magic-link": {
+      "types": "./dist/magic-link.d.ts",
+      "import": "./dist/magic-link.js"
+    },
+    "./api-key": {
+      "types": "./dist/api-key.d.ts",
+      "import": "./dist/api-key.js"
+    },
+    "./store/kv": {
+      "types": "./dist/store/kv.d.ts",
+      "import": "./dist/store/kv.js"
+    },
+    "./store/d1": {
+      "types": "./dist/store/d1.d.ts",
+      "import": "./dist/store/d1.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "hono": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "hono": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.21.3",
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "hono": "^4.6.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.0"
+  }
+}

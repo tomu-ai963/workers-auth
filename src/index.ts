@@ -1,0 +1,210 @@
+/**
+ * @tomu-ai/workers-auth
+ *
+ * Auth session management for Cloudflare Workers + Hono.
+ * The client is deliberately thin; all state lives on the server.
+ */
+
+import type { Context, Hono, MiddlewareHandler } from 'hono';
+
+import { resolveCookieConfig } from './cookie.js';
+import {
+  clearSessionCookies,
+  createMiddleware,
+  readCookieSession,
+  verifyProviders,
+  type AuthEvent,
+  type MiddlewareOptions,
+  type ResolvedAuthConfig,
+} from './middleware.js';
+import { createRoutes, createSessionFor, type CreateSessionOptions } from './routes.js';
+import type {
+  AuthProvider,
+  AuthUser,
+  Clock,
+  CookieConfig,
+  CsrfConfig,
+  Session,
+  SessionConfig,
+  SessionStore,
+} from './types.js';
+
+export type CreateAuthOptions = {
+  /** Tried in order; the first success wins. */
+  providers: AuthProvider[];
+  store: SessionStore;
+  cookie?: CookieConfig;
+  /**
+   * Both TTLs are required together. Omit the whole object to take the
+   * defaults (7 day idle / 30 day absolute).
+   */
+  session?: SessionConfig;
+  csrf?: CsrfConfig;
+  /**
+   * Persist the provider's whole claim set in the session record so that
+   * `c.get('user').claims` survives across requests. Off by default: claims go
+   * stale, and the session store is not the right home for profile data.
+   */
+  storeUserClaims?: boolean;
+  /** Default redirect target for `GET /callback`. Must be a relative path. */
+  callbackRedirect?: string;
+  /** Structured audit hook. Never receives raw tokens — only fingerprints. */
+  onEvent?: (event: AuthEvent) => void;
+  clock?: Clock;
+};
+
+export type Auth = {
+  middleware(options?: MiddlewareOptions): MiddlewareHandler;
+  routes(): Hono;
+  /** Mint a session for an already-verified subject and set the cookies. */
+  createSession(c: Context, user: AuthUser, options?: CreateSessionOptions): Promise<Session>;
+  /** Revoke the current cookie session and clear the cookies. */
+  destroySession(c: Context): Promise<void>;
+  /** Run the provider chain against a raw request. */
+  verify(req: Request, env?: unknown): Promise<AuthUser | null>;
+  readonly config: ResolvedAuthConfig;
+};
+
+const DEFAULT_IDLE_TTL_SEC = 60 * 60 * 24 * 7; // 7 days
+const DEFAULT_ABSOLUTE_TTL_SEC = 60 * 60 * 24 * 30; // 30 days
+const DEFAULT_TOUCH_INTERVAL_SEC = 60;
+
+function resolveSessionConfig(config: SessionConfig | undefined) {
+  if (config === undefined) {
+    return {
+      idleTtlSec: DEFAULT_IDLE_TTL_SEC,
+      absoluteTtlSec: DEFAULT_ABSOLUTE_TTL_SEC,
+      touchIntervalSec: DEFAULT_TOUCH_INTERVAL_SEC,
+    };
+  }
+  const { idleTtlSec, absoluteTtlSec, touchIntervalSec = DEFAULT_TOUCH_INTERVAL_SEC } = config;
+
+  // Both expiries are mandatory. Configuring one and letting the other default
+  // is exactly how sessions end up effectively immortal.
+  if (typeof idleTtlSec !== 'number' || !Number.isFinite(idleTtlSec) || idleTtlSec <= 0) {
+    throw new TypeError('createAuth: session.idleTtlSec must be a positive number of seconds');
+  }
+  if (typeof absoluteTtlSec !== 'number' || !Number.isFinite(absoluteTtlSec) || absoluteTtlSec <= 0) {
+    throw new TypeError('createAuth: session.absoluteTtlSec must be a positive number of seconds');
+  }
+  if (absoluteTtlSec < idleTtlSec) {
+    throw new TypeError('createAuth: session.absoluteTtlSec must be >= session.idleTtlSec');
+  }
+  if (!Number.isFinite(touchIntervalSec) || touchIntervalSec < 0) {
+    throw new TypeError('createAuth: session.touchIntervalSec must be >= 0');
+  }
+  return { idleTtlSec, absoluteTtlSec, touchIntervalSec };
+}
+
+export function createAuth(options: CreateAuthOptions): Auth {
+  if (!Array.isArray(options.providers)) {
+    throw new TypeError('createAuth: providers must be an array');
+  }
+  if (!options.store || typeof options.store.get !== 'function') {
+    throw new TypeError('createAuth: a SessionStore is required');
+  }
+
+  const callbackRedirect = options.callbackRedirect ?? '/';
+  if (!callbackRedirect.startsWith('/') || callbackRedirect.startsWith('//')) {
+    throw new TypeError('createAuth: callbackRedirect must be a same-origin relative path');
+  }
+
+  const config: ResolvedAuthConfig = {
+    providers: options.providers,
+    store: options.store,
+    cookie: resolveCookieConfig(options.cookie),
+    session: resolveSessionConfig(options.session),
+    csrf: options.csrf ?? {},
+    clock: options.clock ?? Date.now,
+    storeUserClaims: options.storeUserClaims === true,
+    callbackRedirect,
+    onEvent: options.onEvent ?? (() => {}),
+  };
+
+  return {
+    config,
+    middleware(middlewareOptions?: MiddlewareOptions) {
+      return createMiddleware(config, middlewareOptions);
+    },
+    routes() {
+      return createRoutes(config);
+    },
+    createSession(c, user, createOptions) {
+      return createSessionFor(c, config, user, createOptions);
+    },
+    async destroySession(c) {
+      const { session } = await readCookieSession(c, config);
+      if (session) await config.store.revoke(session.sid);
+      clearSessionCookies(c, config);
+    },
+    verify(req, env) {
+      return verifyProviders(config.providers, req, env, config.onEvent);
+    },
+  };
+}
+
+// --- re-exports -------------------------------------------------------------
+
+export type {
+  AuthErrorBody,
+  AuthErrorCode,
+  AuthProvider,
+  AuthUser,
+  Clock,
+  CookieConfig,
+  CsrfConfig,
+  NewSession,
+  RevocationList,
+  Session,
+  SessionConfig,
+  SessionScope,
+  SessionStore,
+  SubjectType,
+} from './types.js';
+
+export {
+  getOptionalUser,
+  getSession,
+  getUser,
+  readCookieSession,
+  resolveRequestAuth,
+  sessionToUser,
+  verifyProviders,
+  type AuthEvent,
+  type MiddlewareOptions,
+  type ResolvedAuthConfig,
+} from './middleware.js';
+
+export { createRoutes, createSessionFor, safeRedirectPath, type CreateSessionOptions } from './routes.js';
+
+export {
+  getCookie,
+  parseCookies,
+  resolveCookieConfig,
+  serializeCookie,
+  serializeCookieDeletion,
+  type CookieAttributes,
+  type ResolvedCookieConfig,
+} from './cookie.js';
+
+export {
+  checkDoubleSubmit,
+  checkOrigin,
+  DEFAULT_CSRF_HEADER,
+  isStateChanging,
+  issueCsrfToken,
+  SAFE_METHODS,
+  verifyCsrf,
+  type CsrfResult,
+} from './csrf.js';
+
+export {
+  base64urlDecode,
+  base64urlEncode,
+  fingerprint,
+  randomToken,
+  secretEquals,
+  sha256Hex,
+  timingSafeEqual,
+  verifySecretHash,
+} from './crypto.js';
