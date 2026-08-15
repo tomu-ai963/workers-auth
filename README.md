@@ -45,6 +45,7 @@ no benefit.
 | `kvSessionStore({ allowUnrevocableSessions: true })` | ✅ | ✅ (up to ~60s to propagate) | ❌ — no-op |
 | `kvSessionStore({ revocation })` | ✅ | ✅ immediate | ✅ |
 | `d1SessionStore()` | ✅ | ✅ immediate | ✅ |
+| `d1SessionStore({ revocation })` | ✅ | ✅ immediate | ✅, and cascades to any other store sharing that `revocation` |
 
 KV alone is the simplest and cheapest option, and it is enough for most apps —
 "revoke one session" (logout) always works. What it structurally cannot do is
@@ -59,6 +60,16 @@ inferred silently — omitting both throws when you build the store, not when
 you eventually call `revokeAllForUser()` during an incident. Switch to
 `d1SessionStore()` for anything with a "log out everywhere" / "revoke on
 password change" requirement.
+
+The fourth row is not a higher guarantee level than plain `d1SessionStore()`
+— D1 alone already gives you all three, immediately, with no extra table.
+It's for a narrower situation: **`revocation` is shared with a *different*
+`SessionStore` instance** — typically a `kvSessionStore` run alongside this
+one, or being migrated away from — so that revoking through *either* store
+also invalidates the other's sessions, via the one `RevocationList` both of
+them check. If nothing else in your app is reading the same `RevocationList`,
+leave `revocation` unset on `d1SessionStore()`: there would be nothing on the
+other end to propagate to, and it would only cost writes.
 
 ## Minimal setup
 
@@ -228,6 +239,12 @@ Strongly consistent, so revocation — including `revokeAllForUser()` — is
 immediate and needs no extra table. Costs one D1 read per authenticated
 request. Exposes an extra `cleanup(now?)` for a cron trigger. Apply
 `migrations/0001_sessions.sql` first.
+
+Also accepts `revocation`, but only for the case where it's the *same*
+`RevocationList` another `SessionStore` (typically a `kvSessionStore`) is
+also using — see the fourth row under
+[Choosing a session store](#choosing-a-session-store). Leave it unset
+otherwise; this store doesn't need it for anything of its own.
 
 ### `revocationList(d1, options?)` — KV + full revocation guarantees
 

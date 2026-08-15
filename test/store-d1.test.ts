@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { sha256Hex } from '../src/crypto.js';
 import { d1SessionStore } from '../src/store/d1.js';
+import { kvSessionStore } from '../src/store/kv.js';
 import { revocationList } from '../src/store/revocation.js';
 import { resetStorage } from './helpers/reset.js';
 
@@ -153,5 +154,54 @@ describe('d1SessionStore', () => {
     expect(
       d1SessionStore(env.DB, { clock, revocation: revocationList(env.DB, { clock }) }).canRevokeAllForUser,
     ).toBe(true);
+  });
+});
+
+/**
+ * The one thing `revocation` actually does for `d1SessionStore`: when the
+ * same `RevocationList` is shared with a different `SessionStore`,
+ * revoking through one reaches the other's sessions too. On its own,
+ * `d1SessionStore` never needs this — its own `revoke()`/`revokeAllForUser()`
+ * are already immediate DELETEs against its own table.
+ */
+describe('d1SessionStore: revocation shared with another store', () => {
+  it("revokeAllForUser() on the D1 store also invalidates a KV store's sessions sharing the same list", async () => {
+    const shared = revocationList(env.DB, { clock });
+    const d1Store = d1SessionStore(env.DB, { clock, revocation: shared });
+    const kvStore = kvSessionStore(env.KV, { clock, revocation: shared });
+
+    const d1Session = await d1Store.create(NEW_SESSION);
+    const kvSession = await kvStore.create(NEW_SESSION);
+
+    await d1Store.revokeAllForUser('user_1');
+
+    expect(await d1Store.get(d1Session.sid)).toBeNull();
+    expect(await kvStore.get(kvSession.sid)).toBeNull();
+  });
+
+  it('revoke() (single session) on the D1 store does not affect the KV store — only revokeAllForUser() cascades', async () => {
+    const shared = revocationList(env.DB, { clock });
+    const d1Store = d1SessionStore(env.DB, { clock, revocation: shared });
+    const kvStore = kvSessionStore(env.KV, { clock, revocation: shared });
+
+    const d1Session = await d1Store.create(NEW_SESSION);
+    const kvSession = await kvStore.create(NEW_SESSION);
+
+    await d1Store.revoke(d1Session.sid);
+
+    expect(await d1Store.get(d1Session.sid)).toBeNull();
+    expect(await kvStore.get(kvSession.sid)).not.toBeNull();
+  });
+
+  it('without a shared revocation list, a D1 store revoking a user does not touch an unrelated KV store', async () => {
+    const d1Store = d1SessionStore(env.DB, { clock });
+    const kvStore = kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true });
+
+    await d1Store.create(NEW_SESSION);
+    const kvSession = await kvStore.create(NEW_SESSION);
+
+    await d1Store.revokeAllForUser('user_1');
+
+    expect(await kvStore.get(kvSession.sid)).not.toBeNull();
   });
 });

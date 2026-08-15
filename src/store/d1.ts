@@ -17,7 +17,19 @@ export type { RevocationListOptions } from './revocation.js';
 export type D1SessionStoreOptions = {
   /** Table name. Must be a bare SQL identifier. Default: `auth_sessions`. */
   table?: string;
-  /** Optional extra revocation list. Redundant for D1; accepted for symmetry. */
+  /**
+   * A `RevocationList` shared with at least one *other* `SessionStore`
+   * instance — typically a `kvSessionStore` migrated from or run alongside
+   * this one, so that "log out everywhere" reaches sessions in both stores
+   * regardless of which store's `revokeAllForUser()` triggered it.
+   *
+   * A `d1SessionStore` on its own never needs this: `revoke()` and
+   * `revokeAllForUser()` are already immediate and authoritative against
+   * D1's own table (see the class doc comment above), so an unshared
+   * `RevocationList` here would only be written to and never consulted for
+   * anything this store itself does. Leave it unset unless another store is
+   * actually reading the same `RevocationList` instance.
+   */
   revocation?: RevocationList;
   clock?: Clock;
 };
@@ -161,6 +173,10 @@ export function d1SessionStore(db: D1Database, options: D1SessionStoreOptions = 
 
     async revoke(sid: string): Promise<void> {
       const sidHash = await sha256Hex(sid);
+      // Tombstoning here is a no-op for this store's own get() — the row is
+      // already gone by the time this returns, and get() never consults
+      // `revocation` for a row it can't find. It only matters if `revocation`
+      // is shared with another store, so that store's get() also rejects sid.
       if (revocation) {
         const row = await readRow(sidHash);
         if (row) await revocation.revoke(sidHash, row.absolute_expires_at);
@@ -169,12 +185,18 @@ export function d1SessionStore(db: D1Database, options: D1SessionStoreOptions = 
     },
 
     /**
-     * D1 is strongly consistent, so a single DELETE is authoritative — no
-     * enumeration hazard, and no revocation list required.
+     * D1 is strongly consistent, so a single DELETE is authoritative against
+     * this store's own table — no enumeration hazard, and no revocation list
+     * required for that to hold.
+     *
+     * Writing to `revocation` (when attached) is the one thing this method
+     * does that isn't for this store's own benefit: it's what lets a *shared*
+     * `RevocationList` propagate "log out everywhere" to another store's
+     * sessions too, e.g. `d1SessionStore` and `kvSessionStore` run side by
+     * side during a migration between them.
      */
     async revokeAllForUser(userId: string): Promise<void> {
       if (revocation) {
-        // Only relevant when the list is shared with another store.
         await revocation.revokeUser(userId, now() + 1);
       }
       await db.prepare(`DELETE FROM ${table} WHERE user_id = ?1`).bind(userId).run();
