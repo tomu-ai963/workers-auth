@@ -37,11 +37,13 @@ export type NeonAuthOptions = {
   /** Allowed signature algorithms. Default: RS256 / ES256 / EdDSA. */
   algorithms?: JwsAlgorithm[];
   /**
-   * Leeway for exp/nbf, in seconds. Default: 60.
+   * Leeway for exp/nbf, in seconds. Default: 30.
    *
    * Zero tolerance turns ordinary clock drift between the issuer and the edge
-   * into sporadic 401s that are miserable to diagnose. 60s is the usual choice
-   * and costs a minute of extra validity on an already short-lived token.
+   * into sporadic 401s that are miserable to diagnose. 30s absorbs that drift
+   * while keeping the extra validity an expired token gets away with short —
+   * see SECURITY.md for the tradeoff. Callers can override in either
+   * direction.
    */
   clockToleranceSec?: number;
   /** How long a fetched JWKS stays fresh. Default: 600s. */
@@ -241,7 +243,7 @@ export function neonAuth(options: NeonAuthOptions): AuthProvider {
     issuer,
     audience,
     algorithms = DEFAULT_ALGORITHMS,
-    clockToleranceSec = 60,
+    clockToleranceSec = 30,
     jwksCacheTtlSec = 600,
     minRefetchIntervalSec = 60,
     fetchTimeoutMs = 3000,

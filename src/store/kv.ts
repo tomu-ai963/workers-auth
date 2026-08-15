@@ -28,10 +28,19 @@ export type KvSessionStoreOptions = {
   /** Key prefix for idle-window markers. Default: `seen:`. */
   seenPrefix?: string;
   /**
-   * Strongly-consistent revocation list. Without it `revoke()` is subject to
-   * KV's eventual consistency and `revokeAllForUser()` throws outright.
+   * Strongly-consistent revocation list. Without it, `revokeAllForUser()`
+   * cannot be offered — see `allowUnrevocableSessions`.
    */
   revocation?: RevocationList;
+  /**
+   * Explicitly opts into a store that can never revoke every session of a
+   * user. Required when `revocation` is omitted; `kvSessionStore()` throws at
+   * construction otherwise. This is a construction-time choice on purpose:
+   * `revokeAllForUser()` is normally only called during incident response
+   * ("log out everywhere" after a compromised account), which is the worst
+   * possible moment to discover a missing dependency for the first time.
+   */
+  allowUnrevocableSessions?: boolean;
   /**
    * Tombstone horizon used when `revoke()` cannot read the session record (KV
    * read-after-write lag). Default: 30 days.
@@ -92,6 +101,15 @@ export function kvSessionStore(kv: KVNamespace, options: KvSessionStoreOptions =
   const prefix = options.prefix ?? 'sess:';
   const seenPrefix = options.seenPrefix ?? 'seen:';
   const revocation = options.revocation;
+
+  if (!revocation && !options.allowUnrevocableSessions) {
+    throw new Error(
+      'kvSessionStore: to use revokeAllForUser() safely, pass `revocation: revocationList(env.DB)`. ' +
+        'If only single-session revocation (logout) is needed, pass `allowUnrevocableSessions: true` ' +
+        'to acknowledge that revokeAllForUser() will not be available.',
+    );
+  }
+
   const tombstoneFallbackMs = (options.tombstoneFallbackSec ?? 60 * 60 * 24 * 30) * 1000;
   const touchThrottleMs = (options.touchThrottleSec ?? 10) * 1000;
   const now: Clock = options.clock ?? Date.now;
@@ -227,24 +245,19 @@ export function kvSessionStore(kv: KVNamespace, options: KvSessionStoreOptions =
     },
 
     /**
-     * Requires a revocation list, and says so loudly rather than doing the job
-     * halfway.
+     * No-op without a revocation list — `allowUnrevocableSessions: true` is
+     * the only way construction succeeds in that case, so the caller already
+     * acknowledged this method can't do its job.
      *
      * The obvious KV-only implementation — keep a `uidx:<userId>:*` index and
      * list it — cannot work: KV's listing is eventually consistent, so a
      * session created shortly before the revocation may not be in the listing
      * yet and would survive "log out everywhere" without a trace. There is no
-     * KV-only construction that fixes that, so the store refuses instead.
+     * KV-only construction that fixes that, which is why the store requires
+     * an explicit opt-in at construction time rather than failing here.
      */
     async revokeAllForUser(userId: string): Promise<void> {
-      if (!revocation) {
-        throw new Error(
-          'kvSessionStore: revokeAllForUser() requires a revocation list. ' +
-            'KV listing is eventually consistent, so a KV-only sweep can silently miss a ' +
-            'freshly created session. Pass `revocation: revocationList(env.DB)`, or use ' +
-            'd1SessionStore.',
-        );
-      }
+      if (!revocation) return;
       // `now + 1` so a session created in the same millisecond is also caught.
       await revocation.revokeUser(userId, now() + 1);
     },

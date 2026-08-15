@@ -14,7 +14,12 @@ let now = 1_700_000_000_000;
 const clock = () => now;
 
 function makeStore(extra: Parameters<typeof kvSessionStore>[1] = {}): SessionStore {
-  return kvSessionStore(env.KV, { clock, touchThrottleSec: 0, ...extra });
+  return kvSessionStore(env.KV, {
+    clock,
+    touchThrottleSec: 0,
+    ...(extra.revocation ? {} : { allowUnrevocableSessions: true }),
+    ...extra,
+  });
 }
 
 const NEW_SESSION = {
@@ -163,7 +168,7 @@ describe('kvSessionStore', () => {
   });
 
   it('throttles idle-marker writes to protect the KV per-key write limit', async () => {
-    const store = kvSessionStore(env.KV, { clock, touchThrottleSec: 10 });
+    const store = kvSessionStore(env.KV, { clock, touchThrottleSec: 10, allowUnrevocableSessions: true });
     const created = await store.create(NEW_SESSION);
 
     now += 1000;
@@ -184,7 +189,7 @@ describe('kvSessionStore', () => {
 describe('kvSessionStore: revoke cannot be undone by a concurrent touch', () => {
   it('keeps a revoked session dead when a touch lands afterwards', async () => {
     const g = gatedKv(env.KV);
-    const store = kvSessionStore(g.kv, { clock, touchThrottleSec: 0 });
+    const store = kvSessionStore(g.kv, { clock, touchThrottleSec: 0, allowUnrevocableSessions: true });
     const created = await store.create(NEW_SESSION);
 
     // Request A is mid-touch: its write is pending.
@@ -205,7 +210,7 @@ describe('kvSessionStore: revoke cannot be undone by a concurrent touch', () => 
 
   it('holds even when the touch is the very first write for that session', async () => {
     const g = gatedKv(env.KV);
-    const store = kvSessionStore(g.kv, { clock, touchThrottleSec: 0 });
+    const store = kvSessionStore(g.kv, { clock, touchThrottleSec: 0, allowUnrevocableSessions: true });
     const created = await store.create(NEW_SESSION);
 
     g.hold();
@@ -235,13 +240,32 @@ describe('kvSessionStore: revoke cannot be undone by a concurrent touch', () => 
   });
 });
 
-describe('kvSessionStore: revokeAllForUser', () => {
-  it('refuses to run without a revocation list instead of half working', async () => {
-    const store = makeStore();
-    await store.create(NEW_SESSION);
-    await expect(store.revokeAllForUser('user_1')).rejects.toThrow(/requires a revocation list/);
+describe('kvSessionStore: construction-time revocation requirement', () => {
+  it('throws when built with neither revocation nor allowUnrevocableSessions', () => {
+    expect(() => kvSessionStore(env.KV, { clock })).toThrow(/allowUnrevocableSessions/);
   });
 
+  it('builds successfully with allowUnrevocableSessions: true alone', () => {
+    expect(() => kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true })).not.toThrow();
+  });
+
+  it('builds successfully with a revocation list, regardless of allowUnrevocableSessions', () => {
+    const revocation = revocationList(env.DB, { clock });
+    expect(() => kvSessionStore(env.KV, { clock, revocation })).not.toThrow();
+    expect(() =>
+      kvSessionStore(env.KV, { clock, revocation, allowUnrevocableSessions: false }),
+    ).not.toThrow();
+  });
+
+  it('revokeAllForUser() is a no-op when built with allowUnrevocableSessions: true', async () => {
+    const store = kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true });
+    const created = await store.create(NEW_SESSION);
+    await expect(store.revokeAllForUser('user_1')).resolves.toBeUndefined();
+    expect(await store.get(created.sid)).not.toBeNull();
+  });
+});
+
+describe('kvSessionStore: revokeAllForUser', () => {
   it('invalidates every session of the user, and only that user', async () => {
     const store = makeStore({ revocation: revocationList(env.DB, { clock }) });
     const a1 = await store.create(NEW_SESSION);

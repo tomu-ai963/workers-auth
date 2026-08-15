@@ -41,7 +41,7 @@ no benefit.
 
 | configuration | login / logout | revoke one session | log out everywhere |
 | --- | --- | --- | --- |
-| `kvSessionStore()` alone | ✅ | ✅ (up to ~60s to propagate) | ❌ — **throws** |
+| `kvSessionStore({ allowUnrevocableSessions: true })` | ✅ | ✅ (up to ~60s to propagate) | ❌ — no-op |
 | `kvSessionStore({ revocation })` | ✅ | ✅ immediate | ✅ |
 | `d1SessionStore()` | ✅ | ✅ immediate | ✅ |
 
@@ -50,9 +50,13 @@ KV alone is the simplest and cheapest option, and it is enough for most apps —
 "log out every session of this user": that requires enumerating a user's
 sessions, and KV's `list()` is eventually consistent, so a session created just
 before the sweep can be missed and survive it silently. Rather than offer that
-half-guarantee, `kvSessionStore().revokeAllForUser()` throws. Attach a
-`revocationList` (one D1 table, no change to the rest of your stack) or switch
-to `d1SessionStore()` for anything with a "log out everywhere" / "revoke on
+half-guarantee, `kvSessionStore()` requires you to say which tradeoff you want
+**at construction time**: either attach a `revocationList` (one D1 table, no
+change to the rest of your stack), or pass `allowUnrevocableSessions: true` to
+acknowledge that `revokeAllForUser()` will be a no-op. Neither option is
+inferred silently — omitting both throws when you build the store, not when
+you eventually call `revokeAllForUser()` during an incident. Switch to
+`d1SessionStore()` for anything with a "log out everywhere" / "revoke on
 password change" requirement.
 
 ## Minimal setup
@@ -77,7 +81,7 @@ app.use('*', async (c, next) => {
         cache: { kv: c.env.KV },
       }),
     ],
-    store: kvSessionStore(c.env.KV),
+    store: kvSessionStore(c.env.KV, { allowUnrevocableSessions: true }),
     cookie: { prefix: '__Host-', name: 'session' },
     session: { idleTtlSec: 60 * 60 * 24 * 7, absoluteTtlSec: 60 * 60 * 24 * 30 },
   });
@@ -94,7 +98,7 @@ If your bindings come from a module-scope `env` instead, build the instance once
 and reuse it:
 
 ```ts
-const auth = createAuth({ providers: [...], store: kvSessionStore(env.KV) });
+const auth = createAuth({ providers: [...], store: kvSessionStore(env.KV, { allowUnrevocableSessions: true }) });
 
 app.use('/api/*', auth.middleware());
 app.route('/auth', auth.routes());
@@ -159,7 +163,12 @@ eventually-consistent deletes make the TTL garbage collection, not access
 control. `touch()` throttles its own writes (`touchThrottleSec`, default 10) to
 stay under KV's per-key write-rate limit on an active session.
 
-`revokeAllForUser()` throws unless a `revocation` list is attached — see
+Construction itself requires you to pick a revocation posture: either pass
+`revocation: revocationList(env.DB)`, or pass `allowUnrevocableSessions: true`
+to acknowledge that `revokeAllForUser()` will be a no-op. Omitting both throws
+immediately, rather than deferring the failure to the moment
+`revokeAllForUser()` is actually called — typically during incident response,
+the worst time to discover a missing dependency for the first time. See
 [Choosing a session store](#choosing-a-session-store).
 
 ### `d1SessionStore(db, options?)`
@@ -204,9 +213,10 @@ providers swappable.
 
 JWKS verification for RS256 / ES256 / EdDSA (RS384, RS512 and ES384 are also
 available via `algorithms`). `iss`, `aud`, `exp` and `nbf` are all enforced,
-with a 60 second default clock-skew tolerance (`clockToleranceSec`) — enough to
+with a 30 second default clock-skew tolerance (`clockToleranceSec`) — enough to
 absorb ordinary drift between the issuer and the edge without turning it into
-sporadic 401s.
+sporadic 401s, without extending an expired token's effective lifetime too far.
+See [SECURITY.md](./SECURITY.md#jwt-verification-neonauth) for the tradeoff.
 
 The JWKS is cached at module scope and optionally in KV (`cache: { kv }`). An
 unknown `kid` triggers exactly one refetch, rate limited to one network call
@@ -236,7 +246,7 @@ const provider = magicLink({
 const auth = createAuth({
   providers: [],                    // NOT here
   callbackProviders: [provider],    // only /callback runs this
-  store: kvSessionStore(env.KV),
+  store: kvSessionStore(env.KV, { allowUnrevocableSessions: true }),
 });
 
 await provider.start('user@example.com');   // always returns { ok: true }

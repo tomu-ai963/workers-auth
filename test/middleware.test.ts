@@ -27,7 +27,7 @@ const stubProvider: AuthProvider = {
 function build(overrides: Partial<CreateAuthOptions> = {}) {
   const auth = createAuth({
     providers: [stubProvider],
-    store: kvSessionStore(env.KV, { clock }),
+    store: kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true }),
     session: { idleTtlSec: 7 * DAY, absoluteTtlSec: 30 * DAY, touchIntervalSec: 60 },
     clock,
     ...overrides,
@@ -586,7 +586,7 @@ describe('createSession meta namespace', () => {
 
 describe('createAuth configuration', () => {
   it('requires both expiries', () => {
-    const store = kvSessionStore(env.KV, { clock });
+    const store = kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true });
     expect(() =>
       createAuth({ providers: [], store, session: { idleTtlSec: 3600 } as never }),
     ).toThrow(/absoluteTtlSec/);
@@ -599,7 +599,7 @@ describe('createAuth configuration', () => {
   });
 
   it('defaults to 7 day idle / 30 day absolute', () => {
-    const auth = createAuth({ providers: [], store: kvSessionStore(env.KV, { clock }) });
+    const auth = createAuth({ providers: [], store: kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true }) });
     expect(auth.config.session).toEqual({
       idleTtlSec: 7 * DAY,
       absoluteTtlSec: 30 * DAY,
@@ -611,7 +611,7 @@ describe('createAuth configuration', () => {
     expect(() =>
       createAuth({
         providers: [],
-        store: kvSessionStore(env.KV, { clock }),
+        store: kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true }),
         callbackRedirect: 'https://evil.example.com',
       }),
     ).toThrow(/relative path/);

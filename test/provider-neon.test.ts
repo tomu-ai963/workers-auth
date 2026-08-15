@@ -137,15 +137,15 @@ describe('neonAuth', () => {
     expect(await provider.verify(bearer(fresh), env)).not.toBeNull();
   });
 
-  it('defaults to a 60 second clock-skew tolerance', async () => {
+  it('defaults to a 30 second clock-skew tolerance', async () => {
     const { fetchImpl } = jwksFetch([rsaKey.jwk]);
     const provider = neonAuth({ jwksUrl: freshUrl(), issuer: ISSUER, audience: AUDIENCE, fetchImpl, clock });
 
-    // The issuer's clock is 45s ahead of ours: exp already looks past on paper.
-    const skewed = await signJwt(rsaKey, claims({ exp: nowSec() - 45 }));
+    // The issuer's clock is 20s ahead of ours: exp already looks past on paper.
+    const skewed = await signJwt(rsaKey, claims({ exp: nowSec() - 20 }));
     expect(await provider.verify(bearer(skewed), env)).not.toBeNull();
 
-    const tooOld = await signJwt(rsaKey, claims({ exp: nowSec() - 90 }));
+    const tooOld = await signJwt(rsaKey, claims({ exp: nowSec() - 45 }));
     expect(await provider.verify(bearer(tooOld), env)).toBeNull();
   });
 

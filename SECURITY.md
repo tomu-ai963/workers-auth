@@ -69,10 +69,13 @@ The short version: `kvSessionStore()` alone can always revoke one session
 that requires enumerating a user's sessions and KV's `list()` is eventually
 consistent — a session created moments before the sweep can be missing from the
 listing and survive it. Rather than offer a "log out everywhere" that
-sometimes doesn't, `kvSessionStore().revokeAllForUser()` throws unless a
-`revocationList` is attached. `revocationList` and `d1SessionStore` both answer
-"log out everywhere" with a single timestamp comparison (`created_at <
-revoked_before`) that needs no enumeration and therefore cannot miss a session.
+sometimes doesn't, `kvSessionStore()` requires the caller to pick a posture
+**at construction time**: attach a `revocationList`, or pass
+`allowUnrevocableSessions: true` to explicitly accept that
+`revokeAllForUser()` will be a no-op. Omitting both throws when the store is
+built. `revocationList` and `d1SessionStore` both answer "log out everywhere"
+with a single timestamp comparison (`created_at < revoked_before`) that needs
+no enumeration and therefore cannot miss a session.
 
 ### CSRF
 
@@ -151,10 +154,19 @@ authentication signal. Detail belongs in your own logs via `onEvent`.
   import; a hostile JWKS cannot smuggle `key_ops` or `alg` tricks past WebCrypto.
 - The key type must match the header algorithm — an RSA key cannot be used to
   satisfy an `ES256` header.
-- `iss`, `aud`, `exp` and `nbf` are all verified, with a 60 second default
-  tolerance (`clockToleranceSec`) — enough to absorb ordinary clock drift
-  between the issuer and the edge without it showing up as sporadic,
-  hard-to-diagnose 401s.
+- `iss`, `aud`, `exp` and `nbf` are all verified, with a 30 second default
+  tolerance (`clockToleranceSec`). This is a separate lever from session
+  revocation: leeway only widens the window `exp`/`nbf` are checked against
+  during JWT verification (proof of identity), while `revoke()` /
+  `revokeAllForUser()` invalidate the *session* the JWT led to — increasing
+  one has no effect on the other. The tradeoff leeway makes: raising it
+  reduces false 401s caused by clock drift between Neon and the Worker's edge,
+  but every extra second is also a second an expired token keeps working past
+  its stated `exp`. 30s was chosen as a deliberately conservative value —
+  lower than the 60s often used elsewhere — because for this SDK the
+  immediacy of expiry matters more than shaving off the rare drift-caused
+  401. It is a per-call option (`clockToleranceSec`), so raise or lower it for
+  your own deployment if the tradeoff should land differently there.
 - A token without `exp` is rejected.
 - The JWKS fetch is bounded: `fetchTimeoutMs` (default 3000ms),
   `maxJwksBytes` (default 256KB, checked against both `Content-Length` and the
@@ -215,13 +227,27 @@ consistent: a session created shortly before the sweep can be absent from the
 listing and survive "log out everywhere" without any error or indication that
 anything was missed.
 
-**Fix**: `kvSessionStore().revokeAllForUser()` now throws unless a
-`revocationList` is attached, and the reverse index is gone entirely —
-enumeration-based revocation was the bug, so it was removed rather than
-patched. `revocationList.revokeUser(userId, revokedBefore)` writes one
-timestamp; a session is invalid if `createdAt < revokedBefore`. No listing, no
-missed session. `d1SessionStore().revokeAllForUser()` was always a single
-strongly-consistent `DELETE` and needed no change.
+**Fix**: `kvSessionStore()` requires a `revocationList` or an explicit
+`allowUnrevocableSessions: true`, checked at construction (see below — this
+was originally a call-time throw, moved to construction time in a follow-up),
+and the reverse index is gone entirely — enumeration-based revocation was the
+bug, so it was removed rather than patched. `revocationList.revokeUser(userId,
+revokedBefore)` writes one timestamp; a session is invalid if `createdAt <
+revokedBefore`. No listing, no missed session. `d1SessionStore().revokeAllForUser()`
+was always a single strongly-consistent `DELETE` and needed no change.
+
+**Follow-up**: the original fix above still let `kvSessionStore()` construct
+successfully without a `revocationList`, and only threw once
+`revokeAllForUser()` was actually called. That call tends to happen almost
+exclusively during incident response ("log out everywhere" after a compromised
+account) — the worst possible moment to discover a missing dependency for the
+first time, since it would not have surfaced in ordinary development or
+testing. The check was moved to construction time: `kvSessionStore()` now
+throws immediately unless `revocation` is set or `allowUnrevocableSessions:
+true` is passed to explicitly accept the reduced guarantee. With
+`allowUnrevocableSessions: true`, `revokeAllForUser()` is a no-op instead of
+throwing — the caller already acknowledged this at construction, so there is
+no second throw to hit later.
 
 ### [Fixed, was P1] Magic-link tokens were replayable, even on D1
 
