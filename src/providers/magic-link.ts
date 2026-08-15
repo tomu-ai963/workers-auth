@@ -161,7 +161,13 @@ export type MagicLinkOptions = {
   dangerouslyAllowReplayableTokens?: boolean;
   /** Where to find the token on an incoming request. */
   getToken?: (req: Request) => string | null | Promise<string | null>;
-  /** Map a verified address to your own user record. Default: id = email. */
+  /**
+   * Map a verified address to your own user record. Default: id = email.
+   *
+   * The returned `AuthUser` must set its own `rateLimitId` — this provider
+   * cannot guess a stable value for a record it did not create. Use whatever
+   * your own user record treats as its durable primary key.
+   */
   resolveUser?: (email: string) => AuthUser | null | Promise<AuthUser | null>;
   /** Observability hook for delivery failures. Never receives the raw token. */
   onSendError?: (error: unknown) => void;
@@ -287,6 +293,9 @@ export function magicLink(options: MagicLinkOptions): MagicLinkProvider {
       return {
         id: record.email,
         subjectType: 'user',
+        // No `resolveUser` means the address itself is the durable identity
+        // (it's already `id`, above) — nothing more stable exists to key on.
+        rateLimitId: record.email,
         email: record.email,
         claims: { email: record.email, provider: name },
       };

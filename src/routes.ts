@@ -65,6 +65,10 @@ export async function createSessionFor(
   const authMeta: AuthMeta = {
     ...(user.email ? { email: user.email } : {}),
     ...(typeof user.claims['provider'] === 'string' ? { provider: user.claims['provider'] } : {}),
+    // Unconditional, unlike `claims` below: this is a stable identifier, not
+    // a profile-data dump, so it doesn't go stale the way full claims can —
+    // see the `AuthMeta.rateLimitId` doc comment.
+    rateLimitId: user.rateLimitId,
     ...(config.storeUserClaims ? { claims: user.claims } : {}),
   };
 

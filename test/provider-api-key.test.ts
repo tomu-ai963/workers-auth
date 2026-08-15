@@ -60,6 +60,24 @@ describe.each(stores)('apiKey (%s store)', (_label, makeStore) => {
     });
   });
 
+  it('keys rateLimitId on the key, not the subject it acts as', async () => {
+    const store = makeStore();
+    // Two keys for the same subject: rate limiting must not conflate them,
+    // or one hot/compromised key exhausts the other's quota too.
+    const a = await issueApiKey({ store, env: 'live', subjectId: 'svc_shared', clock });
+    const b = await issueApiKey({ store, env: 'live', subjectId: 'svc_shared', clock });
+
+    const provider = apiKey({ store, clock });
+    const userA = await provider.verify(withKey(a.key), env);
+    const userB = await provider.verify(withKey(b.key), env);
+
+    expect(userA?.id).toBe('svc_shared');
+    expect(userB?.id).toBe('svc_shared');
+    expect(userA?.rateLimitId).toBe(a.keyId);
+    expect(userB?.rateLimitId).toBe(b.keyId);
+    expect(userA?.rateLimitId).not.toBe(userB?.rateLimitId);
+  });
+
   it('accepts the x-api-key header as well', async () => {
     const store = makeStore();
     const issued = await issueApiKey({ store, env: 'test', subjectId: 'svc_1', clock });

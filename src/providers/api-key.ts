@@ -308,6 +308,11 @@ export function apiKey(options: ApiKeyOptions): AuthProvider {
       return {
         id: record.subjectId,
         subjectType: 'service',
+        // A subject can hold several keys (e.g. one per deployment); rate
+        // limiting must key on the key actually presented, not the subject
+        // it acts as, or one compromised/hot key would exhaust every other
+        // key's quota too.
+        rateLimitId: record.keyId,
         claims: {
           ...(record.claims ?? {}),
           keyId: record.keyId,

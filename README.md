@@ -275,7 +275,13 @@ around for `maxSessionLifetimeSec` (default 90 days; set it to the longest
 
 Providers are tried in array order and the first success wins. Provider-specific
 values live in `AuthUser.claims`, never on the top level — that is what keeps
-providers swappable.
+providers swappable. The one exception is `AuthUser.rateLimitId`: every
+provider sets it to whatever it treats as the stable identifier to rate-limit
+on (`apiKey` → the key id, `neonAuth` → the JWT `sub`, `magicLink` → the
+verified email, or whatever a `resolveUser` callback returns), so a rate
+limiter can always read `user.rateLimitId` without knowing which provider is
+configured. See [SECURITY.md](./SECURITY.md#authuserratelimitid) for why this
+one field is top-level and how each provider picks its value.
 
 ### `neonAuth({ jwksUrl, issuer, audience })`
 
@@ -309,6 +315,8 @@ const provider = magicLink({
     await sendWithYourProvider(email, `https://app.example.com/auth/callback?token=${token}`);
   },
   resolveUser: async (email) => lookupUser(email),   // optional; default id = email
+  // ^ lookupUser's returned AuthUser must set its own rateLimitId — this
+  // provider can't guess a stable key for a record it didn't create.
 });
 
 const auth = createAuth({

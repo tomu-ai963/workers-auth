@@ -137,8 +137,23 @@ export type AuthUser = {
   subjectType: SubjectType;
   email?: string;
   /**
-   * Provider-specific values live here and ONLY here. Do not hoist provider
-   * fields onto the top level — doing so makes providers un-swappable.
+   * The identifier a rate limiter should key on. Required — every
+   * `AuthUser`-producing site (built-in provider, custom `AuthProvider`, or a
+   * `magicLink` `resolveUser` callback) must pick one deliberately rather than
+   * leaving callers to guess which of `id` / `claims.keyId` / `claims.sub` is
+   * the stable value for a given provider.
+   *
+   * This is the one deliberate exception to "provider-specific values live in
+   * `claims`": rate limiting is a cross-cutting concern like authentication
+   * itself, not a provider-specific detail, so it gets its own top-level
+   * field instead of forcing every caller to branch on `claims` per provider.
+   * See SECURITY.md for why each built-in provider picks the value it does.
+   */
+  rateLimitId: string;
+  /**
+   * Provider-specific values live here and ONLY here (aside from
+   * `rateLimitId` above). Do not hoist provider fields onto the top level —
+   * doing so makes providers un-swappable.
    */
   claims: Record<string, unknown>;
 };

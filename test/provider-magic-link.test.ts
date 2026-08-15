@@ -163,6 +163,7 @@ describe('magicLink', () => {
     expect(user?.id).toBe('user@example.com');
     expect(user?.email).toBe('user@example.com');
     expect(user?.subjectType).toBe('user');
+    expect(user?.rateLimitId).toBe('user@example.com');
     expect(user?.claims['provider']).toBe('magic-link');
 
     expect(await provider.verify(callbackRequest(token), env)).toBeNull();
@@ -220,6 +221,7 @@ describe('magicLink', () => {
       resolveUser: async (email) => ({
         id: 'user_7',
         subjectType: 'user' as const,
+        rateLimitId: 'user_7',
         email,
         claims: { plan: 'pro' },
       }),
@@ -227,6 +229,7 @@ describe('magicLink', () => {
     await provider.start('user@example.com');
     const user = await provider.verify(callbackRequest(sent[0]?.token as string), env);
     expect(user?.id).toBe('user_7');
+    expect(user?.rateLimitId).toBe('user_7');
     expect(user?.claims).toEqual({ plan: 'pro', provider: 'magic-link' });
   });
 

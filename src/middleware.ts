@@ -53,6 +53,14 @@ export type AuthMeta = {
   email?: string;
   provider?: string;
   claims?: Record<string, unknown>;
+  /**
+   * Persisted unconditionally (unlike `claims`, which is gated behind
+   * `storeUserClaims`) so a cookie-authenticated request rebuilt by
+   * {@link sessionToUser} on request N+1 still has the same `rateLimitId` a
+   * rate limiter saw on request 1 — without this, a limiter reading
+   * `user.rateLimitId` would see it only on the login request itself.
+   */
+  rateLimitId?: string;
 };
 
 export type ResolvedSessionConfig = {
@@ -122,6 +130,7 @@ export function sessionToUser(session: Session | SessionInfo): AuthUser {
     email?: unknown;
     provider?: unknown;
     claims?: unknown;
+    rateLimitId?: unknown;
   };
   const claims = (auth.claims && typeof auth.claims === 'object' ? auth.claims : {}) as Record<
     string,
@@ -131,6 +140,10 @@ export function sessionToUser(session: Session | SessionInfo): AuthUser {
     id: session.userId,
     subjectType: session.subjectType,
     ...(typeof auth.email === 'string' ? { email: auth.email } : {}),
+    // Falls back to `userId` for a session written before `rateLimitId`
+    // existed in `meta.__auth` (a pre-upgrade session still live at deploy
+    // time) — never surfaces as missing, even though it wasn't provider-set.
+    rateLimitId: typeof auth.rateLimitId === 'string' && auth.rateLimitId ? auth.rateLimitId : session.userId,
     claims: {
       ...claims,
       ...(typeof auth.provider === 'string' ? { provider: auth.provider } : {}),
@@ -148,7 +161,18 @@ export async function verifyProviders(
   for (const provider of providers) {
     try {
       const user = await provider.verify(req, env);
-      if (user) return user;
+      if (user) {
+        // A provider that forgets `rateLimitId` is a config/implementation
+        // bug, not "bad credentials" — but it must still fail closed rather
+        // than hand application code (and any rate limiter reading
+        // `user.rateLimitId`) an unset value. Caught below like any other
+        // provider error, so it shows up as `auth.failed` with this
+        // provider's name rather than a bare 500.
+        if (typeof user.rateLimitId !== 'string' || user.rateLimitId.length === 0) {
+          throw new TypeError(`provider "${provider.name}" returned a user with no rateLimitId`);
+        }
+        return user;
+      }
     } catch (error) {
       // A broken provider must not authenticate anyone, and must not stop the
       // next provider from being tried.

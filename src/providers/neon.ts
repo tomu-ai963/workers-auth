@@ -432,6 +432,9 @@ export function neonAuth(options: NeonAuthOptions): AuthProvider {
       return {
         id: sub,
         subjectType: 'user',
+        // `sub` is stable across re-logins, unlike the session id, so rate
+        // limiting stays continuous across them. See SECURITY.md.
+        rateLimitId: sub,
         ...(typeof email === 'string' ? { email } : {}),
         claims: { ...payload, provider: name },
       };

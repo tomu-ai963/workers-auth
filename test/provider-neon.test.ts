@@ -57,6 +57,7 @@ describe('neonAuth', () => {
     expect(user?.id).toBe('user_42');
     expect(user?.email).toBe('user42@example.com');
     expect(user?.subjectType).toBe('user');
+    expect(user?.rateLimitId).toBe('user_42');
     expect(user?.claims['provider']).toBe('neon');
     expect(user?.claims['iss']).toBe(ISSUER);
     expect(state.calls).toBe(1);

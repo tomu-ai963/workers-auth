@@ -28,7 +28,7 @@ const stubProvider: AuthProvider = {
   async verify(req) {
     const id = req.headers.get('x-test-user');
     if (!id) return null;
-    return { id, subjectType: 'user', email: `${id}@example.com`, claims: { provider: 'stub' } };
+    return { id, subjectType: 'user', rateLimitId: id, email: `${id}@example.com`, claims: { provider: 'stub' } };
   },
 };
 
@@ -55,7 +55,7 @@ function build(overrides: Partial<CreateAuthOptions> = {}) {
     const meta = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
     await auth.createSession(
       c,
-      { id: 'user_x', subjectType: 'user', claims: {} },
+      { id: 'user_x', subjectType: 'user', rateLimitId: 'user_x', claims: {} },
       { meta },
     );
     return c.json({ ok: true });
@@ -316,6 +316,89 @@ describe('cookie sessions', () => {
     now += 31 * DAY * 1000;
     const res = await app.fetch(new Request(`${ORIGIN}/api/me`, { headers: { cookie: cookieHeader(jar) } }));
     expect(res.status).toBe(401);
+  });
+});
+
+describe('rateLimitId', () => {
+  it('survives a second request that never re-runs the provider', async () => {
+    const { app } = build();
+    const jar = await login(app, 'user_1');
+
+    // The first read comes back from `sessionToUser` rebuilding off the
+    // cookie session, same as every request after login — `stubProvider`
+    // only runs on POST /session itself.
+    const first = (await (
+      await app.fetch(new Request(`${ORIGIN}/api/me`, { headers: { cookie: cookieHeader(jar) } }))
+    ).json()) as AuthUser;
+    const second = (await (
+      await app.fetch(new Request(`${ORIGIN}/api/me`, { headers: { cookie: cookieHeader(jar) } }))
+    ).json()) as AuthUser;
+    expect(first.rateLimitId).toBe('user_1');
+    expect(second.rateLimitId).toBe('user_1');
+  });
+
+  it('persists into session meta even when storeUserClaims is off', async () => {
+    const { app } = build({ storeUserClaims: false });
+    const jar = await login(app, 'user_2');
+
+    const user = (await (
+      await app.fetch(new Request(`${ORIGIN}/api/me`, { headers: { cookie: cookieHeader(jar) } }))
+    ).json()) as AuthUser;
+    // Unlike full claims (gated by storeUserClaims — see SECURITY.md "Known
+    // limits"), rateLimitId round-trips through the session unconditionally.
+    expect(user.rateLimitId).toBe('user_2');
+  });
+
+  it('falls back to userId when reconstructing a session written before rateLimitId existed', async () => {
+    const store = kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true });
+    const auth = createAuth({
+      providers: [stubProvider],
+      store,
+      session: { idleTtlSec: 7 * DAY, absoluteTtlSec: 30 * DAY, touchIntervalSec: 60 },
+      clock,
+    });
+    const app = new Hono();
+    app.use('/api/*', auth.middleware());
+    app.get('/api/me', (c) => c.json(getUser(c)));
+
+    // Stand-in for a session record written by a pre-upgrade deploy: no
+    // `rateLimitId` under `meta.__auth` at all, since that key didn't exist
+    // yet when the session was created.
+    const session = await store.create({
+      userId: 'legacy_user',
+      subjectType: 'user',
+      idleTtlSec: 7 * DAY,
+      absoluteTtlSec: 30 * DAY,
+      meta: { __auth: { email: 'legacy@example.com' } },
+    });
+
+    const res = await app.fetch(
+      new Request(`${ORIGIN}/api/me`, { headers: { cookie: `${SESSION_COOKIE}=${session.sid}` } }),
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as AuthUser).rateLimitId).toBe('legacy_user');
+  });
+
+  it('fails closed, with an auditable reason, when a provider omits it', async () => {
+    const brokenProvider: AuthProvider = {
+      name: 'broken',
+      async verify(req) {
+        if (!req.headers.get('x-broken')) return null;
+        // Simulates a plain-JS caller ignoring the TypeScript contract.
+        return { id: 'x', subjectType: 'user', claims: {} } as AuthUser;
+      },
+    };
+    const events: Array<Record<string, unknown>> = [];
+    const { app } = build({
+      providers: [brokenProvider],
+      onEvent: (e) => events.push(e as unknown as Record<string, unknown>),
+    });
+
+    const res = await app.fetch(new Request(`${ORIGIN}/api/me`, { headers: { 'x-broken': '1' } }));
+    expect(res.status).toBe(401);
+    expect(
+      events.some((e) => e['type'] === 'auth.failed' && e['provider'] === 'broken'),
+    ).toBe(true);
   });
 });
 

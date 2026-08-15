@@ -186,6 +186,63 @@ authentication signal. Detail belongs in your own logs via `onEvent`.
   fetches, not as a hard global cap. Set `cache: { kv }` to reduce how often
   isolates need to hit the network at all.
 
+### `AuthUser.rateLimitId`
+
+A single stable identifier, always set, for a rate limiter to key on —
+`user.rateLimitId` — instead of every caller having to work out which of
+`user.id` / `claims.keyId` / `claims.sub` is the right value for whichever
+provider happens to be configured.
+
+**Why top-level, not under `claims`.** Every other provider-specific value
+lives in `claims` and stays there deliberately — see
+[Layer 2: providers](./README.md#layer-2-providers) — so that providers are
+swappable without application code branching on which one is active. Rate
+limiting is the one exception: it is a cross-cutting concern on the same
+level as authentication itself (every authenticated request needs an
+identifier to limit on, regardless of provider), not a provider-specific
+detail. Burying it in `claims` would have re-created exactly the problem this
+field exists to close — a caller having to know, per provider, which claim
+key to read.
+
+**Why the value differs per provider.** Each provider already has a natural
+answer for "what's the stable identifier a rate limiter should never lose
+continuity on," and it isn't always `id`:
+
+| provider | `rateLimitId` | why not `id`? |
+| --- | --- | --- |
+| `apiKey` | `claims.keyId` (the key presented) | `id` is the subject the key acts as, and one subject can hold several keys (e.g. one per deployment); limiting by subject would let a hot or compromised key exhaust every other key's quota too. |
+| `neonAuth` | JWT `sub` | happens to equal `id` here — `sub` is already the identity `id` is set from. |
+| `magicLink`, no `resolveUser` | the verified email address | it's already `id` in this configuration — no more stable value exists to fall back to. |
+| `magicLink`, with `resolveUser` | whatever the callback's `AuthUser.rateLimitId` says | the SDK didn't create that user record, so it cannot guess a stable key for it — `resolveUser` implementations must set this themselves. |
+
+**Persistence.** `rateLimitId` is written into `Session.meta.__auth`
+unconditionally by `createSessionFor` — unlike the rest of `claims`, which is
+only persisted when `storeUserClaims` is on (see
+[Known limits](#known-limits)). Without this, a cookie-authenticated request
+on request 2+ would rebuild `AuthUser` via `sessionToUser()` from the stored
+session and lose `rateLimitId`, even though request 1 (the login itself) had
+it — a rate limiter reading `user.rateLimitId` would then see it only on
+`POST /session`, not on the requests that follow. `sessionToUser()` falls
+back to `session.userId` when a stored session predates this field (a session
+written by a version of this SDK before `rateLimitId` existed), so an
+in-flight session across a deploy never surfaces an empty value — see
+[Known limits](#known-limits) for what that fallback means operationally.
+
+**Enforcement.** `AuthUser.rateLimitId` is a required field, and
+`verifyProviders()` throws if a provider (built-in or custom) returns a user
+without one — caught by the same handling as any other provider error, so it
+surfaces as `auth.failed` with that provider's name via `onEvent`, and the
+request fails closed with the uniform `401`, rather than continuing with a
+value that would silently defeat rate limiting.
+
+**Migration note (this field replaces an interim workaround, not part of this
+SDK).** A caller using the `apiKey` provider that was reading
+`user.claims.keyId ?? user.id` itself as the rate-limit key can switch to
+reading `user.rateLimitId` directly — for `apiKey` the value is identical
+(`claims.keyId` is still set too, unchanged, so this is a non-breaking
+switch). This is the SDK now doing formally, for every provider, what that
+call site was working around for one.
+
 ### Magic links
 
 Single use and confined to the callback route — the two properties that make a
@@ -382,8 +439,10 @@ Read these before shipping.
 2. **No rate limiting.** This package does not throttle `POST /session`,
    `magicLink.start()` or API key verification. Put a limiter in front of them.
 3. **`storeUserClaims` duplicates identity data** into the session record, where
-   it goes stale. Off by default; only the subject's email and provider name are
-   persisted (under `meta.__auth`).
+   it goes stale. Off by default; only the subject's email, provider name, and
+   `rateLimitId` are persisted (under `meta.__auth`) regardless — see
+   [`AuthUser.rateLimitId`](#authuserratelimitid) for why that one field is the
+   exception.
 4. **`Session.scope` is not enforced.** It is carried through the store and
    returned to you, but nothing in this version evaluates org/role
    authorization.
