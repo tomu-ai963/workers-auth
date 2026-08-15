@@ -79,11 +79,17 @@ doesn't rely on trusting client-controlled input.
 ## Not deferred — already implemented in Step 1.5
 
 For reference, since a review of this file benefits from not re-litigating what
-was already done: `touch()` KV split, `revokeAllForUser` user-marker + throw
-without a revocation list, magic-link `atomicTake` gate, `callbackProviders`
-split, `Cache-Control: no-store`, JWKS timeout/size/key-count limits, `sid`
-removed from `SessionInfo`, `meta.__auth` namespacing, `hono` peer dependency
-fix, 60s JWT clock tolerance, `kvApiKeyStore` revocation key split + `touch`
-implementation, `d1MagicLinkStore.cleanup()`, `d1SessionStore.cleanup()` index
-split, cookie `path`/`domain` header-injection guard. See SECURITY.md's "Fixed
-findings" section for the reasoning behind each.
+was already done: `touch()` KV split, `revokeAllForUser` user-marker, magic-link
+`atomicTake` gate, `callbackProviders` split, `Cache-Control: no-store`, JWKS
+timeout/size/key-count limits, `sid` removed from `SessionInfo`, `meta.__auth`
+namespacing, `hono` peer dependency fix, JWT clock tolerance, `kvApiKeyStore`
+revocation key split + `touch` implementation, `d1MagicLinkStore.cleanup()`,
+`d1SessionStore.cleanup()` index split, cookie `path`/`domain`
+header-injection guard. See SECURITY.md's "Fixed findings" section for the
+reasoning behind each.
+
+Two of these were further revised in Step 1.5-b, after this list was written:
+`kvSessionStore()` now throws at construction time unless `revocation` or
+`allowUnrevocableSessions: true` is set (rather than throwing only when
+`revokeAllForUser()` is called), and the JWT clock tolerance default moved
+from 60s to 30s. See SECURITY.md for both.
