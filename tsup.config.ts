@@ -9,6 +9,7 @@ export default defineConfig({
     'store/kv': 'src/store/kv.ts',
     'store/d1': 'src/store/d1.ts',
     client: 'src/client.ts',
+    testing: 'src/testing.ts',
   },
   format: ['esm'],
   target: 'es2022',

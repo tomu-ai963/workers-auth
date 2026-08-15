@@ -5,8 +5,16 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { createAuth, getOptionalUser, getSession, getUser, type CreateAuthOptions } from '../src/index.js';
 import { d1MagicLinkStore, magicLink } from '../src/providers/magic-link.js';
 import { kvSessionStore } from '../src/store/kv.js';
+import { cookieHeader, getSetCookies, loginForCookies, readCookieJar, type CookieJar } from '../src/testing.js';
 import type { AuthProvider, AuthUser } from '../src/types.js';
 import { resetStorage } from './helpers/reset.js';
+
+// This suite always uses the default cookie config, so the two cookie names
+// are fixed. `readCookieJar`/`cookieHeader` don't assume any particular
+// name — see src/testing.ts — so these are what let a handful of assertions
+// below read a specific value back out of the jar.
+const SESSION_COOKIE = '__Host-session';
+const CSRF_COOKIE = '__Host-csrf';
 
 const DAY = 60 * 60 * 24;
 const ORIGIN = 'https://app.example.com';
@@ -56,44 +64,20 @@ function build(overrides: Partial<CreateAuthOptions> = {}) {
   return { app, auth };
 }
 
-type Jar = { session?: string; csrf?: string };
-
-/** `Headers.getSetCookie` exists in workerd but is missing from workers-types. */
-function setCookies(res: Response): string[] {
-  return (res.headers as unknown as { getSetCookie(): string[] }).getSetCookie();
-}
-
-function readCookies(res: Response): Jar {
-  const jar: Jar = {};
-  for (const header of setCookies(res)) {
-    const [pair] = header.split(';') as [string];
-    const idx = pair.indexOf('=');
-    const name = pair.slice(0, idx);
-    const value = decodeURIComponent(pair.slice(idx + 1));
-    if (name === '__Host-session') jar.session = value;
-    if (name === '__Host-csrf') jar.csrf = value;
-  }
-  return jar;
-}
-
-function cookieHeader(jar: Jar): string {
-  return [
-    jar.session ? `__Host-session=${encodeURIComponent(jar.session)}` : null,
-    jar.csrf ? `__Host-csrf=${encodeURIComponent(jar.csrf)}` : null,
-  ]
-    .filter(Boolean)
-    .join('; ');
-}
-
-async function login(app: Hono, userId = 'user_1'): Promise<Jar> {
-  const res = await app.fetch(
+/**
+ * Provider-specific (the `x-test-user` header only `stubProvider` above
+ * understands), so it stays local — only the cookie-jar mechanics it uses
+ * (`loginForCookies`, `readCookieJar`, `cookieHeader`) come from
+ * `src/testing.js`.
+ */
+async function login(app: Hono, userId = 'user_1'): Promise<CookieJar> {
+  return loginForCookies(
+    (req) => app.fetch(req),
     new Request(`${ORIGIN}/auth/session`, {
       method: 'POST',
       headers: { origin: ORIGIN, 'x-test-user': userId },
     }),
   );
-  expect(res.status).toBe(200);
-  return readCookies(res);
 }
 
 beforeEach(async () => {
@@ -152,7 +136,7 @@ describe('POST /session', () => {
     );
 
     expect(res.status).toBe(200);
-    const cookies = setCookies(res);
+    const cookies = getSetCookies(res);
     expect(cookies).toHaveLength(2);
 
     const session = cookies.find((c) => c.startsWith('__Host-session=')) as string;
@@ -169,7 +153,7 @@ describe('POST /session', () => {
 
     const body = (await res.json()) as { user: AuthUser; session: Record<string, unknown> };
     expect(body.user.id).toBe('user_1');
-    expect(JSON.stringify(body)).not.toContain(readCookies(res).session as string);
+    expect(JSON.stringify(body)).not.toContain(readCookieJar(res)[SESSION_COOKIE] as string);
     expect(body.session['sid']).toBeUndefined();
   });
 
@@ -214,14 +198,14 @@ describe('POST /session', () => {
           origin: ORIGIN,
           'x-test-user': 'user_1',
           cookie: cookieHeader(first),
-          'x-csrf-token': first.csrf as string,
+          'x-csrf-token': first[CSRF_COOKIE] as string,
         },
       }),
     );
     expect(second.status).toBe(200);
-    const rotated = readCookies(second);
-    expect(rotated.session).not.toBe(first.session);
-    expect(rotated.csrf).not.toBe(first.csrf);
+    const rotated = readCookieJar(second);
+    expect(rotated[SESSION_COOKIE]).not.toBe(first[SESSION_COOKIE]);
+    expect(rotated[CSRF_COOKIE]).not.toBe(first[CSRF_COOKIE]);
 
     // The old session is gone, not merely shadowed.
     const stale = await app.fetch(
@@ -252,7 +236,7 @@ describe('cookie sessions', () => {
     const res = await app.fetch(
       new Request(`${ORIGIN}/api/things`, {
         method: 'POST',
-        headers: { origin: ORIGIN, cookie: `__Host-session=${jar.session as string}` },
+        headers: { origin: ORIGIN, cookie: `__Host-session=${jar[SESSION_COOKIE] as string}` },
       }),
     );
     expect(res.status).toBe(403);
@@ -282,7 +266,7 @@ describe('cookie sessions', () => {
         headers: {
           origin: 'https://evil.example.com',
           cookie: cookieHeader(jar),
-          'x-csrf-token': jar.csrf as string,
+          'x-csrf-token': jar[CSRF_COOKIE] as string,
         },
       }),
     );
@@ -296,7 +280,7 @@ describe('cookie sessions', () => {
     const res = await app.fetch(
       new Request(`${ORIGIN}/api/things`, {
         method: 'POST',
-        headers: { origin: ORIGIN, cookie: cookieHeader(jar), 'x-csrf-token': jar.csrf as string },
+        headers: { origin: ORIGIN, cookie: cookieHeader(jar), 'x-csrf-token': jar[CSRF_COOKIE] as string },
       }),
     );
     expect(res.status).toBe(200);
@@ -345,7 +329,7 @@ describe('GET /session', () => {
     );
     expect(res.status).toBe(200);
     const text = await res.text();
-    expect(text).not.toContain(jar.session as string);
+    expect(text).not.toContain(jar[SESSION_COOKIE] as string);
     expect(JSON.parse(text)).toMatchObject({
       user: { id: 'user_1' },
       session: { userId: 'user_1', subjectType: 'user' },
@@ -367,12 +351,12 @@ describe('POST /logout', () => {
     const res = await app.fetch(
       new Request(`${ORIGIN}/auth/logout`, {
         method: 'POST',
-        headers: { origin: ORIGIN, cookie: cookieHeader(jar), 'x-csrf-token': jar.csrf as string },
+        headers: { origin: ORIGIN, cookie: cookieHeader(jar), 'x-csrf-token': jar[CSRF_COOKIE] as string },
       }),
     );
     expect(res.status).toBe(200);
 
-    const cleared = setCookies(res);
+    const cleared = getSetCookies(res);
     expect(cleared.every((c) => c.includes('Max-Age=0'))).toBe(true);
     expect(cleared.some((c) => c.startsWith('__Host-session='))).toBe(true);
     expect(cleared.some((c) => c.startsWith('__Host-csrf='))).toBe(true);
@@ -390,7 +374,7 @@ describe('POST /logout', () => {
     const res = await app.fetch(
       new Request(`${ORIGIN}/auth/logout`, {
         method: 'POST',
-        headers: { origin: ORIGIN, cookie: `__Host-session=${jar.session as string}` },
+        headers: { origin: ORIGIN, cookie: `__Host-session=${jar[SESSION_COOKIE] as string}` },
       }),
     );
     expect(res.status).toBe(403);
@@ -429,8 +413,8 @@ describe('GET /callback', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/dashboard');
 
-    const jar = readCookies(res);
-    expect(jar.session).toBeDefined();
+    const jar = readCookieJar(res);
+    expect(jar[SESSION_COOKIE]).toBeDefined();
 
     const me = await app.fetch(new Request(`${ORIGIN}/api/me`, { headers: { cookie: cookieHeader(jar) } }));
     expect((await me.json()) as AuthUser).toMatchObject({ id: 'user@example.com' });
@@ -548,7 +532,7 @@ describe('the raw session id never reaches application code', () => {
     const body = (await res.json()) as { session: Record<string, unknown> };
     expect(body.session.userId).toBe('user_1');
     expect('sid' in body.session).toBe(false);
-    expect(JSON.stringify(body)).not.toContain(jar.session as string);
+    expect(JSON.stringify(body)).not.toContain(jar[SESSION_COOKIE] as string);
   });
 });
 
@@ -575,7 +559,7 @@ describe('createSession meta namespace', () => {
       }),
     );
     expect(res.status).toBe(200);
-    const jar = readCookies(res);
+    const jar = readCookieJar(res);
 
     const me = await app.fetch(new Request(`${ORIGIN}/api/me`, { headers: { cookie: cookieHeader(jar) } }));
     const user = (await me.json()) as AuthUser;
@@ -636,15 +620,15 @@ describe('createAuth configuration', () => {
     await app.fetch(
       new Request(`${ORIGIN}/auth/logout`, {
         method: 'POST',
-        headers: { origin: ORIGIN, cookie: cookieHeader(jar), 'x-csrf-token': jar.csrf as string },
+        headers: { origin: ORIGIN, cookie: cookieHeader(jar), 'x-csrf-token': jar[CSRF_COOKIE] as string },
       }),
     );
 
     const types = events.map((e) => e['type']);
     expect(types).toContain('session.created');
     expect(types).toContain('session.revoked');
-    expect(JSON.stringify(events)).not.toContain(jar.session as string);
-    expect(JSON.stringify(events)).not.toContain(jar.csrf as string);
+    expect(JSON.stringify(events)).not.toContain(jar[SESSION_COOKIE] as string);
+    expect(JSON.stringify(events)).not.toContain(jar[CSRF_COOKIE] as string);
   });
 });
 

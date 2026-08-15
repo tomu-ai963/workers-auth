@@ -32,6 +32,7 @@ verification or D1 code:
 | `@tomu-ai/workers-auth/magic-link` | `magicLink`, `kvMagicLinkStore`, `d1MagicLinkStore` |
 | `@tomu-ai/workers-auth/api-key` | `apiKey`, `issueApiKey`, `kvApiKeyStore`, `d1ApiKeyStore` |
 | `@tomu-ai/workers-auth/client` | `createAuthClient` |
+| `@tomu-ai/workers-auth/testing` | `readCookieJar`, `cookieHeader`, `loginForCookies` — see [Testing your integration](#testing-your-integration) |
 
 ## Choosing a session store
 
@@ -400,6 +401,121 @@ D1 migrations ship in `migrations/`. Apply only what you use:
 ```bash
 npx wrangler d1 migrations apply <db> --local
 ```
+
+## Testing your integration
+
+### Prefer real KV/D1 over hand-rolled fakes
+
+Test the parts of your app that sit behind `auth.middleware()` /
+`auth.routes()` against **real Miniflare KV and D1**
+(`@cloudflare/vitest-pool-workers`), not a hand-rolled `Map`-based fake —
+even though a fake is faster to write and faster to run.
+
+This isn't a generic "prefer integration tests" recommendation; it's specific
+to what this SDK does. `kvSessionStore`'s `touch()`/`revoke()` split exists to
+survive a specific KV race (see
+[SECURITY.md](./SECURITY.md#fixed-was-p0-touch-could-resurrect-a-revoked-session)),
+and its expiry/revocation checks are written the way they are *because* KV's
+writes are eventually consistent and its minimum TTL is 60s. A fake that
+resolves `put`/`get`/`delete` synchronously against a `Map` cannot reproduce
+either property, so a regression in this exact area — the one this SDK has
+already shipped and fixed a P0 for once — is precisely the kind of bug such a
+fake would pass and real KV would catch. `d1SessionStore`'s single-statement
+`DELETE ... RETURNING` for atomic magic-link consumption has the same
+relationship to a fake D1: the atomicity is the whole point, and a fake that
+just runs your mock function synchronously can't exercise it.
+
+If your own application logic (not the auth layer) has no such properties to
+get wrong, a fake is a reasonable choice for *that* code — this
+recommendation is about whatever touches `SessionStore`, `RevocationList`, or
+`ApiKeyStore`/`MagicLinkStore`, not a blanket rule for your whole test suite.
+
+### `@tomu-ai/workers-auth/testing`
+
+Cookie-session tests all need the same shape: log in, capture the
+`Set-Cookie` headers, replay them as a `Cookie` header on the next request.
+This subpath exists so that shape doesn't get re-derived — slightly
+differently, with slightly different gaps — in every project that adopts
+this SDK.
+
+```ts
+import { cookieHeader, loginForCookies, readCookieJar } from '@tomu-ai/workers-auth/testing';
+
+// Build whatever Request satisfies your configured AuthProvider — an
+// Authorization header for apiKey/neonAuth, a magic-link token, a test
+// double's own header. loginForCookies just needs a 200 back.
+const jar = await loginForCookies(
+  (req) => app.fetch(req, env),
+  new Request('https://example.com/auth/session', {
+    method: 'POST',
+    headers: { origin: 'https://example.com', authorization: `Bearer ${testApiKey}` },
+  }),
+);
+
+const res = await app.fetch(
+  new Request('https://example.com/api/me', { headers: { cookie: cookieHeader(jar) } }),
+  env,
+);
+```
+
+`readCookieJar` and `cookieHeader` don't assume any particular cookie name or
+prefix — `cookie: { name, csrfName, prefix }` is configurable per
+`createAuth()` call, so they read back whatever names the server actually
+sent rather than hardcoding `__Host-session`/`__Host-csrf`. If a test needs a
+specific cookie's raw value (e.g. to assert it never appears in a response
+body), index the jar by the same name you configured:
+`jar['__Host-session']`, or whatever `cookie.name` resolves to.
+
+Nothing else about your `AuthProvider`, your routes, or your business logic
+is assumed — this subpath only knows about cookies. It has no dependency on
+Hono and no Node builtins, so it's safe to import from a test that runs
+inside `@cloudflare/vitest-pool-workers`' workerd pool.
+
+### D1 migrations in your own test suite
+
+The migrations in [Migrations](#migrations) above ship inside the published
+package (`node_modules/@tomu-ai/workers-auth/migrations`), so a consumer test
+suite that uses `d1SessionStore` / `revocationList` / `d1MagicLinkStore` /
+`d1ApiKeyStore` can apply them the same way this SDK applies them to its own
+tests, without vendoring a copy:
+
+```ts
+// vitest.config.ts
+import { fileURLToPath } from 'node:url';
+import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-pool-workers';
+import { defineConfig } from 'vitest/config';
+
+const migrations = await readD1Migrations(
+  fileURLToPath(new URL('./node_modules/@tomu-ai/workers-auth/migrations', import.meta.url)),
+);
+
+export default defineConfig({
+  plugins: [
+    cloudflareTest({
+      singleWorker: true,
+      miniflare: {
+        compatibilityDate: '2025-04-01',
+        kvNamespaces: ['KV'],
+        d1Databases: ['DB'],
+        bindings: { TEST_MIGRATIONS: migrations },
+      },
+    }),
+  ],
+  test: { setupFiles: ['./test/apply-migrations.ts'] },
+});
+```
+
+```ts
+// test/apply-migrations.ts — runs once per test file
+import { applyD1Migrations, env } from 'cloudflare:test';
+
+await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
+```
+
+`readD1Migrations` and `applyD1Migrations` are `@cloudflare/vitest-pool-workers`'s
+own exports, not this SDK's — there's nothing SDK-specific to wrap here beyond
+pointing them at the bundled `migrations/` directory. If your app also has its
+own migrations, apply both directories in `apply-migrations.ts`.
 
 ## Development
 
