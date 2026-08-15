@@ -112,7 +112,10 @@ export function safeRedirectPath(candidate: string | null | undefined, fallback:
 }
 
 export function createRoutes(config: ResolvedAuthConfig): Hono {
-  const app = new Hono();
+  // See `CreateAuthOptions.basePath`: only set when this sub-app is going to
+  // be handed a full, unstripped request path directly (i.e. mounted via its
+  // own `.fetch()` rather than `app.route()`, which strips the prefix itself).
+  const app = config.basePath ? new Hono().basePath(config.basePath) : new Hono();
 
   // Identity responses must never be stored by anything downstream.
   app.use('*', async (c, next) => {

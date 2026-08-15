@@ -147,4 +147,11 @@ describe('d1SessionStore', () => {
     await store.revokeAllForUser('user_1');
     expect(await store.get(created.sid)).toBeNull();
   });
+
+  it('canRevokeAllForUser is always true, with or without an attached revocation list', () => {
+    expect(d1SessionStore(env.DB, { clock }).canRevokeAllForUser).toBe(true);
+    expect(
+      d1SessionStore(env.DB, { clock, revocation: revocationList(env.DB, { clock }) }).canRevokeAllForUser,
+    ).toBe(true);
+  });
 });

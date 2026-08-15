@@ -28,8 +28,10 @@ export type KvSessionStoreOptions = {
   /** Key prefix for idle-window markers. Default: `seen:`. */
   seenPrefix?: string;
   /**
-   * Strongly-consistent revocation list. Without it, `revokeAllForUser()`
-   * cannot be offered — see `allowUnrevocableSessions`.
+   * Strongly-consistent revocation list. Without it, `revoke()` (a single
+   * session's logout) is subject to KV's eventual consistency, and
+   * `revokeAllForUser()` cannot be offered at all — see
+   * `allowUnrevocableSessions`.
    */
   revocation?: RevocationList;
   /**
@@ -39,6 +41,8 @@ export type KvSessionStoreOptions = {
    * `revokeAllForUser()` is normally only called during incident response
    * ("log out everywhere" after a compromised account), which is the worst
    * possible moment to discover a missing dependency for the first time.
+   * The resulting store's `canRevokeAllForUser` is `false`, so callers can
+   * check it instead of inferring the gap from nothing happening.
    */
   allowUnrevocableSessions?: boolean;
   /**
@@ -122,6 +126,8 @@ export function kvSessionStore(kv: KVNamespace, options: KvSessionStoreOptions =
   }
 
   return {
+    canRevokeAllForUser: Boolean(revocation),
+
     async create(input: NewSession): Promise<Session> {
       assertTtls(input);
       const at = now();
@@ -247,7 +253,10 @@ export function kvSessionStore(kv: KVNamespace, options: KvSessionStoreOptions =
     /**
      * No-op without a revocation list — `allowUnrevocableSessions: true` is
      * the only way construction succeeds in that case, so the caller already
-     * acknowledged this method can't do its job.
+     * acknowledged this method can't do its job. `canRevokeAllForUser`
+     * reflects the same thing at construction time, for a caller that wants
+     * to know *before* calling this rather than infer it from nothing
+     * happening.
      *
      * The obvious KV-only implementation — keep a `uidx:<userId>:*` index and
      * list it — cannot work: KV's listing is eventually consistent, so a

@@ -61,41 +61,64 @@ password change" requirement.
 
 ## Minimal setup
 
+Two setups are supported, depending on where your bindings come from. Pick one
+— **don't mix `basePath` into the second one**, see why below.
+
+### Per request (bindings only exist inside a request)
+
 ```ts
 import { Hono } from 'hono';
-import { createAuth, getUser } from '@tomu-ai/workers-auth';
+import { createAuth, getUser, type Auth } from '@tomu-ai/workers-auth';
 import { kvSessionStore } from '@tomu-ai/workers-auth/store/kv';
 import { neonAuth } from '@tomu-ai/workers-auth/neon';
 
 type Env = { KV: KVNamespace; NEON_JWKS_URL: string };
+type Vars = { auth: Auth };
 
-const app = new Hono<{ Bindings: Env }>();
+const app = new Hono<{ Bindings: Env; Variables: Vars }>();
 
 app.use('*', async (c, next) => {
-  const auth = createAuth({
-    providers: [
-      neonAuth({
-        jwksUrl: c.env.NEON_JWKS_URL,
-        issuer: 'https://api.stack-auth.com/api/v1/projects/<project-id>',
-        audience: '<project-id>',
-        cache: { kv: c.env.KV },
-      }),
-    ],
-    store: kvSessionStore(c.env.KV, { allowUnrevocableSessions: true }),
-    cookie: { prefix: '__Host-', name: 'session' },
-    session: { idleTtlSec: 60 * 60 * 24 * 7, absoluteTtlSec: 60 * 60 * 24 * 30 },
-  });
-  c.set('auth', auth);
+  c.set(
+    'auth',
+    createAuth({
+      providers: [
+        neonAuth({
+          jwksUrl: c.env.NEON_JWKS_URL,
+          issuer: 'https://api.stack-auth.com/api/v1/projects/<project-id>',
+          audience: '<project-id>',
+          cache: { kv: c.env.KV },
+        }),
+      ],
+      store: kvSessionStore(c.env.KV, { allowUnrevocableSessions: true }),
+      cookie: { prefix: '__Host-', name: 'session' },
+      session: { idleTtlSec: 60 * 60 * 24 * 7, absoluteTtlSec: 60 * 60 * 24 * 30 },
+      // Required for the .routes() delegation below — see "basePath" under
+      // "What auth.routes() mounts".
+      basePath: '/auth',
+    }),
+  );
   return next();
 });
+
+// auth.routes() is a Hono sub-app: a plain (request, env) => Response
+// function. Hand it the request directly instead of app.route('/auth', ...),
+// which can only mount something built once, up front — not something built
+// fresh on every request. basePath: '/auth' above is what lets this sub-app
+// match the full incoming path (/auth/session, ...): app.route()'s automatic
+// prefix-stripping never runs on this path, since app.route() isn't used
+// here. No executionCtx argument is needed either — auth.routes() never
+// calls waitUntil.
+app.all('/auth/*', (c) => c.get('auth').routes().fetch(c.req.raw, c.env));
+
+app.use('/api/*', (c, next) => c.get('auth').middleware()(c, next));
+app.get('/api/me', (c) => c.json(getUser(c)));
 ```
 
-Bindings only exist per request in Workers, so `createAuth` is called per
-request above. It allocates nothing expensive: the JWKS cache lives at module
-scope and survives across requests inside the isolate.
+`createAuth` is called per request here because bindings only exist inside a
+request in Workers. It allocates nothing expensive: the JWKS cache lives at
+module scope and survives across requests inside the isolate.
 
-If your bindings come from a module-scope `env` instead, build the instance once
-and reuse it:
+### Module scope (bindings available outside a request)
 
 ```ts
 const auth = createAuth({ providers: [...], store: kvSessionStore(env.KV, { allowUnrevocableSessions: true }) });
@@ -104,6 +127,11 @@ app.use('/api/*', auth.middleware());
 app.route('/auth', auth.routes());
 app.get('/api/me', (c) => c.json(getUser(c)));
 ```
+
+Simpler, and **must not set `basePath`**: `app.route('/auth', auth.routes())`
+already strips the matched `/auth` prefix before delegating to the sub-app, so
+a sub-app that also expects that prefix baked in would need a request for
+`/auth/auth/session` to match anything.
 
 ### What `auth.routes()` mounts
 
@@ -126,6 +154,24 @@ or proxy in front of the Worker cannot serve one user's session to another.
 `GET` must not have side effects, and provider verification can (a magic-link
 token is single-use) — so it never runs on a route that isn't supposed to
 authenticate anyone with it.
+
+#### `basePath`
+
+`createAuth({ basePath })` bakes a path prefix into `auth.routes()` itself
+(via Hono's own `basePath()`), so the returned sub-app matches
+`${basePath}/session` etc. against the *full* request path it's given.
+
+This only matters for one specific mounting style: handing `auth.routes()`
+a request directly (`auth.routes().fetch(request, env)`), which is what the
+per-request setup above does because `createAuth()` has to be rebuilt on every
+request and therefore can't be mounted once, up front, with `app.route()`.
+Without `basePath`, that sub-app only knows about its own bare paths
+(`/session`, not `/auth/session`), so every request to it 404s.
+
+If you mount the ordinary way — `app.route('/auth', auth.routes())`, built
+once at module scope — leave `basePath` unset. `app.route()` already strips
+the matched prefix before delegating, so setting `basePath` too would apply
+the prefix twice.
 
 ### Reading the subject
 
@@ -168,7 +214,11 @@ Construction itself requires you to pick a revocation posture: either pass
 to acknowledge that `revokeAllForUser()` will be a no-op. Omitting both throws
 immediately, rather than deferring the failure to the moment
 `revokeAllForUser()` is actually called — typically during incident response,
-the worst time to discover a missing dependency for the first time. See
+the worst time to discover a missing dependency for the first time. Whichever
+you picked is readable back off the store as `store.canRevokeAllForUser`
+(`true` with a revocation list, `false` with `allowUnrevocableSessions`), so
+code that cares — an audit log, an admin UI — can check it instead of
+inferring the answer from `revokeAllForUser()` doing nothing. See
 [Choosing a session store](#choosing-a-session-store).
 
 ### `d1SessionStore(db, options?)`

@@ -265,6 +265,27 @@ describe('kvSessionStore: construction-time revocation requirement', () => {
   });
 });
 
+describe('kvSessionStore: canRevokeAllForUser', () => {
+  it('is false when built with allowUnrevocableSessions: true', () => {
+    const store = kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true });
+    expect(store.canRevokeAllForUser).toBe(false);
+  });
+
+  it('is true when built with a revocation list', () => {
+    const store = kvSessionStore(env.KV, { clock, revocation: revocationList(env.DB, { clock }) });
+    expect(store.canRevokeAllForUser).toBe(true);
+  });
+
+  it('is true when built with both a revocation list and allowUnrevocableSessions: true', () => {
+    const store = kvSessionStore(env.KV, {
+      clock,
+      revocation: revocationList(env.DB, { clock }),
+      allowUnrevocableSessions: true,
+    });
+    expect(store.canRevokeAllForUser).toBe(true);
+  });
+});
+
 describe('kvSessionStore: revokeAllForUser', () => {
   it('invalidates every session of the user, and only that user', async () => {
     const store = makeStore({ revocation: revocationList(env.DB, { clock }) });

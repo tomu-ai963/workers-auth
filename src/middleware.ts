@@ -74,6 +74,8 @@ export type ResolvedAuthConfig = {
   storeUserClaims: boolean;
   /** Relative path used by `GET /callback` on success. */
   callbackRedirect: string;
+  /** See `CreateAuthOptions.basePath`. Undefined unless the caller set it. */
+  basePath?: string;
   onEvent: (event: AuthEvent) => void;
 };
 

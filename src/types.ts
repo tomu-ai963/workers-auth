@@ -65,12 +65,31 @@ export interface SessionStore {
   create(input: NewSession): Promise<Session>;
   revoke(sid: string): Promise<void>;
   /**
+   * Whether `revokeAllForUser()` on this store can actually guarantee "log
+   * out everywhere," as opposed to being a no-op.
+   *
+   * A store that cannot guarantee it reliably (e.g. a KV-only store with no
+   * {@link RevocationList} attached) MUST refuse that configuration at
+   * *construction* time rather than let the gap go unnoticed until
+   * `revokeAllForUser()` is actually called — see `kvSessionStore`'s
+   * `allowUnrevocableSessions`. By the time a store exists, this flag is
+   * already decided; it exists so a caller can check it — before calling
+   * `revokeAllForUser()`, or while building an audit trail — rather than
+   * only learning the answer from documentation or from the fact that
+   * nothing visibly happened.
+   */
+  readonly canRevokeAllForUser: boolean;
+  /**
    * Revokes every session of a user.
    *
-   * Implementations that cannot guarantee this MUST throw rather than do it
-   * partially — a "log out everywhere" that silently misses a session is worse
-   * than one that refuses to run. `kvSessionStore` throws unless a
-   * {@link RevocationList} is attached.
+   * When `canRevokeAllForUser` is `false`, this resolves without revoking
+   * anything — the caller already accepted that possibility by choosing a
+   * construction that sets the flag to `false`, so there is nothing left to
+   * decide at call time. Implementations MUST NOT throw here for a
+   * configuration that construction already accepted: construction is where
+   * that decision belongs, not the moment "log out everywhere" is actually
+   * needed (typically incident response — the worst time to discover a
+   * missing dependency for the first time).
    */
   revokeAllForUser(userId: string): Promise<void>;
   /** Extends only the idle window. Absolute expiry is never moved. */

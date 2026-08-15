@@ -617,6 +617,18 @@ describe('createAuth configuration', () => {
     ).toThrow(/relative path/);
   });
 
+  it('rejects a basePath that is not a bare leading-slash path', () => {
+    const store = kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true });
+    expect(() => createAuth({ providers: [], store, basePath: 'auth' })).toThrow(/basePath/);
+    expect(() => createAuth({ providers: [], store, basePath: '//auth' })).toThrow(/basePath/);
+    expect(() => createAuth({ providers: [], store, basePath: '/auth/' })).toThrow(/basePath/);
+  });
+
+  it('leaves basePath unset by default', () => {
+    const auth = createAuth({ providers: [], store: kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true }) });
+    expect(auth.config.basePath).toBeUndefined();
+  });
+
   it('emits audit events with fingerprints, never raw ids', async () => {
     const events: Array<Record<string, unknown>> = [];
     const { app } = build({ onEvent: (e) => events.push(e as unknown as Record<string, unknown>) });
@@ -633,5 +645,57 @@ describe('createAuth configuration', () => {
     expect(types).toContain('session.revoked');
     expect(JSON.stringify(events)).not.toContain(jar.session as string);
     expect(JSON.stringify(events)).not.toContain(jar.csrf as string);
+  });
+});
+
+/**
+ * `app.route('/auth', auth.routes())` is exercised by every other test in
+ * this file via `build()`. This block covers the other supported mounting
+ * style: `createAuth()` built per request, with its sub-app handed a raw
+ * request directly (`auth.routes().fetch(...)`) instead of going through
+ * `app.route()`. Without `basePath`, that style 404s — reproducing the bug
+ * command-kun hit — because `auth.routes()` registers bare paths like
+ * `/session` and nothing strips the `/auth` prefix off the incoming request
+ * before it reaches that sub-app's own router.
+ */
+describe('basePath: mounting auth.routes() by delegating .fetch() directly', () => {
+  function buildDelegated(basePath?: string) {
+    const auth = createAuth({
+      providers: [stubProvider],
+      store: kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true }),
+      session: { idleTtlSec: 7 * DAY, absoluteTtlSec: 30 * DAY, touchIntervalSec: 60 },
+      clock,
+      ...(basePath !== undefined ? { basePath } : {}),
+    });
+
+    const app = new Hono();
+    app.all('/auth/*', (c) => auth.routes().fetch(c.req.raw, c.env));
+    return app;
+  }
+
+  it('without basePath, direct delegation 404s on every /auth/* route', async () => {
+    const app = buildDelegated();
+    const res = await app.fetch(new Request(`${ORIGIN}/auth/session`, { method: 'GET' }));
+    expect(res.status).toBe(404);
+  });
+
+  it('with basePath set to the mount point, the route is reached', async () => {
+    const app = buildDelegated('/auth');
+    const res = await app.fetch(new Request(`${ORIGIN}/auth/session`, { method: 'GET' }));
+    // 401 (no session cookie) rather than 404 confirms the route matched.
+    expect(res.status).toBe(401);
+  });
+
+  it('a full login round-trip works through the delegated, basePath-scoped app', async () => {
+    const app = buildDelegated('/auth');
+    const res = await app.fetch(
+      new Request(`${ORIGIN}/auth/session`, {
+        method: 'POST',
+        headers: { origin: ORIGIN, 'x-test-user': 'user_1' },
+      }),
+    );
+    expect(res.status).toBe(200);
+    const setCookie = (res.headers as unknown as { getSetCookie(): string[] }).getSetCookie();
+    expect(setCookie).toHaveLength(2);
   });
 });

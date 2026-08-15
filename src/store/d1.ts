@@ -74,6 +74,10 @@ export function d1SessionStore(db: D1Database, options: D1SessionStoreOptions = 
   }
 
   return {
+    // D1 is strongly consistent, so revokeAllForUser() is always a real
+    // DELETE here — no attached RevocationList is needed to make it work.
+    canRevokeAllForUser: true,
+
     async create(input: NewSession): Promise<Session> {
       if (!Number.isFinite(input.idleTtlSec) || input.idleTtlSec <= 0) {
         throw new TypeError('session: idleTtlSec must be a positive number of seconds');

@@ -77,6 +77,11 @@ built. `revocationList` and `d1SessionStore` both answer "log out everywhere"
 with a single timestamp comparison (`created_at < revoked_before`) that needs
 no enumeration and therefore cannot miss a session.
 
+Every `SessionStore` exposes `canRevokeAllForUser: boolean`, fixed at
+construction, so this is checkable in code rather than only in documentation
+— relevant if "log out everywhere" is a compliance or audit requirement and a
+silent no-op would otherwise be indistinguishable from success.
+
 ### CSRF
 
 Two independent checks on state-changing methods (`POST` / `PUT` / `PATCH` /

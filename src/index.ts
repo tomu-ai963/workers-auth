@@ -58,6 +58,28 @@ export type CreateAuthOptions = {
   storeUserClaims?: boolean;
   /** Default redirect target for `GET /callback`. Must be a relative path. */
   callbackRedirect?: string;
+  /**
+   * Bakes a path prefix into `auth.routes()` itself (via Hono's `basePath()`),
+   * so the returned sub-app matches `${basePath}/session` etc. on the full
+   * request path it's given.
+   *
+   * Use this **only** when `auth.routes()` is mounted by calling its own
+   * `.fetch()` directly — typically because `createAuth()` has to be built
+   * per request (bindings only exist inside a request in Workers), which
+   * rules out `app.route('/auth', auth.routes())` mounted once at module
+   * scope:
+   *
+   * ```ts
+   * const auth = createAuth({ ..., basePath: '/auth' });
+   * app.all('/auth/*', (c) => auth.routes().fetch(c.req.raw, c.env));
+   * ```
+   *
+   * Leave this unset when mounting the ordinary way with
+   * `app.route('/auth', auth.routes())` — Hono's `app.route()` already
+   * strips the matched prefix before delegating, so setting `basePath` too
+   * would apply the prefix twice.
+   */
+  basePath?: string;
   /** Structured audit hook. Never receives raw tokens — only fingerprints. */
   onEvent?: (event: AuthEvent) => void;
   clock?: Clock;
@@ -133,6 +155,15 @@ export function createAuth(options: CreateAuthOptions): Auth {
     throw new TypeError('createAuth: callbackRedirect must be a same-origin relative path');
   }
 
+  const basePath = options.basePath;
+  if (basePath !== undefined) {
+    if (!basePath.startsWith('/') || basePath.startsWith('//') || basePath.endsWith('/')) {
+      throw new TypeError(
+        "createAuth: basePath must look like '/auth' — a leading slash, no trailing slash, no protocol-relative form",
+      );
+    }
+  }
+
   const config: ResolvedAuthConfig = {
     providers: options.providers,
     callbackProviders,
@@ -143,6 +174,7 @@ export function createAuth(options: CreateAuthOptions): Auth {
     clock: options.clock ?? Date.now,
     storeUserClaims: options.storeUserClaims === true,
     callbackRedirect,
+    basePath,
     onEvent: options.onEvent ?? (() => {}),
   };
 
