@@ -17,7 +17,8 @@ Layer 4  client         browser            createAuthClient()
 ## Install
 
 ```bash
-pnpm add @tomu-ai/workers-auth hono
+npm install @tomu-ai/workers-auth hono
+# or: pnpm add @tomu-ai/workers-auth hono
 ```
 
 Subpaths are split so a project that only wants sessions does not pull in JWKS

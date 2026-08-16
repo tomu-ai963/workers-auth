@@ -1,11 +1,19 @@
 {
   "name": "@tomu-ai/workers-auth",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lightweight, secure auth session SDK for Cloudflare Workers + Hono. Thin client, server-held state, zero runtime dependencies.",
   "type": "module",
   "license": "MIT",
   "private": false,
   "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tomu-ai963/workers-auth.git"
+  },
+  "homepage": "https://github.com/tomu-ai963/workers-auth#readme",
+  "bugs": {
+    "url": "https://github.com/tomu-ai963/workers-auth/issues"
+  },
   "engines": {
     "node": ">=20"
   },
