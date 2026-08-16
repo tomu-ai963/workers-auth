@@ -159,20 +159,9 @@ export async function verifyProviders(
   onEvent?: (event: AuthEvent) => void,
 ): Promise<AuthUser | null> {
   for (const provider of providers) {
+    let user: AuthUser | null;
     try {
-      const user = await provider.verify(req, env);
-      if (user) {
-        // A provider that forgets `rateLimitId` is a config/implementation
-        // bug, not "bad credentials" — but it must still fail closed rather
-        // than hand application code (and any rate limiter reading
-        // `user.rateLimitId`) an unset value. Caught below like any other
-        // provider error, so it shows up as `auth.failed` with this
-        // provider's name rather than a bare 500.
-        if (typeof user.rateLimitId !== 'string' || user.rateLimitId.length === 0) {
-          throw new TypeError(`provider "${provider.name}" returned a user with no rateLimitId`);
-        }
-        return user;
-      }
+      user = await provider.verify(req, env);
     } catch (error) {
       // A broken provider must not authenticate anyone, and must not stop the
       // next provider from being tried.
@@ -181,7 +170,24 @@ export async function verifyProviders(
         reason: error instanceof Error ? error.name : 'provider_error',
         provider: provider.name,
       });
+      continue;
     }
+    if (!user) continue;
+    // A provider that forgets `rateLimitId` is a config/implementation bug,
+    // not "bad credentials" — but it must still fail closed rather than hand
+    // application code (and any rate limiter reading `user.rateLimitId`) an
+    // unset value. Reported with its own reason rather than thrown into the
+    // generic catch above, so `onEvent` gets a diagnosable identifier instead
+    // of a bare `"TypeError"`.
+    if (typeof user.rateLimitId !== 'string' || user.rateLimitId.length === 0) {
+      onEvent?.({
+        type: 'auth.failed',
+        reason: 'missing_rate_limit_id',
+        provider: provider.name,
+      });
+      continue;
+    }
+    return user;
   }
   return null;
 }

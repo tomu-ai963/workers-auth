@@ -76,6 +76,24 @@ the real protection this would add.
 **Revisit when**: there's a concrete proposal for the production signal that
 doesn't rely on trusting client-controlled input.
 
+### Remove `sessionToUser()`'s `rateLimitId` → `userId` fallback
+
+**Where**: `src/middleware.ts` — `sessionToUser()`.
+
+**Why deferred**: the fallback exists to keep a pre-upgrade session (written
+before `AuthMeta.rateLimitId` existed) readable after this field was added.
+Now that both `AuthUser`-producing entry points fail closed on a missing
+`rateLimitId` (`verifyProviders()` and `createSessionFor()` — see the F6
+follow-up commit), the fallback's only remaining job is that migration
+compatibility; it can no longer also be masking a caller bug. `sessionToUser`
+returns the public, non-nullable `AuthUser` type, so it cannot itself express
+"this session predates the field" — narrowing that would be a bigger, separate
+type change. Not worth doing as a drive-by here.
+
+**Revisit when**: before publishing this package (a natural point at which no
+pre-upgrade session can exist yet, since there has been no prior release for
+one to have been written under).
+
 ## Not deferred — already implemented in Step 1.5
 
 For reference, since a review of this file benefits from not re-litigating what

@@ -48,18 +48,30 @@ export async function createSessionFor(
   user: AuthUser,
   options: CreateSessionOptions = {},
 ): Promise<Session> {
-  const previous =
-    options.previousSession !== undefined
-      ? options.previousSession
-      : (await readCookieSession(c, config)).session;
-  if (previous) {
-    await config.store.revoke(previous.sid);
+  // Mirrors the `verifyProviders()` guard for the same field: a caller that
+  // verifies its own credentials (password auth, OAuth, etc.) and hands the
+  // result straight to `createSession` bypasses that check entirely, so this
+  // is the other AuthUser entry point that must fail closed rather than
+  // silently fall back to `userId` in `sessionToUser` — see its rateLimitId
+  // doc comment. Checked before the previous session is revoked below, so a
+  // bad call doesn't burn the caller's existing session on its way to
+  // throwing.
+  if (typeof user.rateLimitId !== 'string' || user.rateLimitId.length === 0) {
+    throw new TypeError('createSession: AuthUser.rateLimitId is required and must be a non-empty string');
   }
 
   if (options.meta && AUTH_META_KEY in options.meta) {
     throw new TypeError(
       `createSession: "${AUTH_META_KEY}" is reserved for the SDK; put application metadata under another key`,
     );
+  }
+
+  const previous =
+    options.previousSession !== undefined
+      ? options.previousSession
+      : (await readCookieSession(c, config)).session;
+  if (previous) {
+    await config.store.revoke(previous.sid);
   }
 
   const authMeta: AuthMeta = {

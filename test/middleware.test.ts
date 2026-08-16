@@ -61,6 +61,17 @@ function build(overrides: Partial<CreateAuthOptions> = {}) {
     return c.json({ ok: true });
   });
 
+  // Lets a test drive `auth.createSession` with an AuthUser missing
+  // `rateLimitId` — simulates a self-verifying caller (password auth, OAuth)
+  // that bypasses `verifyProviders()` entirely.
+  app.post('/test/login-no-rate-limit', async (c) => {
+    await auth.createSession(
+      c,
+      { id: 'user_y', subjectType: 'user', claims: {} } as AuthUser,
+    );
+    return c.json({ ok: true });
+  });
+
   return { app, auth };
 }
 
@@ -396,9 +407,31 @@ describe('rateLimitId', () => {
 
     const res = await app.fetch(new Request(`${ORIGIN}/api/me`, { headers: { 'x-broken': '1' } }));
     expect(res.status).toBe(401);
+    // The reason must be the dedicated `missing_rate_limit_id` identifier —
+    // not the generic `TypeError` the shared catch block would otherwise
+    // report, which gives an implementer nothing to act on.
     expect(
-      events.some((e) => e['type'] === 'auth.failed' && e['provider'] === 'broken'),
+      events.some(
+        (e) =>
+          e['type'] === 'auth.failed' &&
+          e['provider'] === 'broken' &&
+          e['reason'] === 'missing_rate_limit_id',
+      ),
     ).toBe(true);
+  });
+
+  it('createSession (the self-verifying entry point) also fails closed, not just verifyProviders', async () => {
+    // F6-a: a caller that verifies its own credentials (password auth,
+    // OAuth) and hands the result straight to `auth.createSession` bypasses
+    // `verifyProviders()` entirely — that path must not silently accept an
+    // AuthUser with no rateLimitId either.
+    const { app } = build();
+    const res = await app.fetch(new Request(`${ORIGIN}/test/login-no-rate-limit`, { method: 'POST' }));
+    expect(res.status).toBe(500);
+
+    // And no session should have been minted on the way to that error.
+    const cookies = getSetCookies(res);
+    expect(cookies).toHaveLength(0);
   });
 });
 
