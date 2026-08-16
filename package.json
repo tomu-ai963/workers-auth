@@ -20,6 +20,7 @@
   "files": [
     "dist",
     "migrations",
+    "LICENSE",
     "README.md",
     "SECURITY.md"
   ],
