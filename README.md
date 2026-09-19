@@ -33,7 +33,7 @@ verification or D1 code:
 | `@tomu-ai/workers-auth/magic-link` | `magicLink`, `kvMagicLinkStore`, `d1MagicLinkStore` |
 | `@tomu-ai/workers-auth/api-key` | `apiKey`, `issueApiKey`, `kvApiKeyStore`, `d1ApiKeyStore` |
 | `@tomu-ai/workers-auth/client` | `createAuthClient` |
-| `@tomu-ai/workers-auth/testing` | `readCookieJar`, `cookieHeader`, `loginForCookies` — see [Testing your integration](#testing-your-integration) |
+| `@tomu-ai/workers-auth/testing` | `readCookieJar`, `cookieHeader`, `loginForCookies`, `waitForEmail`, `extractMagicLinkFromEmail` — see [Testing your integration](#testing-your-integration) |
 
 ## Choosing a session store
 
@@ -493,9 +493,113 @@ body), index the jar by the same name you configured:
 `jar['__Host-session']`, or whatever `cookie.name` resolves to.
 
 Nothing else about your `AuthProvider`, your routes, or your business logic
-is assumed — this subpath only knows about cookies. It has no dependency on
-Hono and no Node builtins, so it's safe to import from a test that runs
-inside `@cloudflare/vitest-pool-workers`' workerd pool.
+is assumed — this subpath only knows about cookies and, below, about the
+shape of a delivered email. It has no dependency on Hono and no Node
+builtins, so it's safe to import from a test that runs inside
+`@cloudflare/vitest-pool-workers`' workerd pool.
+
+#### Magic-link flows
+
+A magic-link E2E test has one extra step the cookie helpers can't cover: the
+token arrives out of band, in an email. `waitForEmail` and
+`extractMagicLinkFromEmail` cover that step without this package learning
+anything about email — the same reason `magicLink()` takes a `sendToken`
+callback instead of an SMTP client.
+
+`waitForEmail` takes **your** "list the mail that has arrived" function. Resend,
+Mailtrap, SES, a local catch-all inbox — whichever you use stays on your side of
+the callback, and this SDK keeps its zero runtime dependencies:
+
+```ts
+import {
+  cookieHeader,
+  extractMagicLinkFromEmail,
+  loginForCookies,
+  waitForEmail,
+} from '@tomu-ai/workers-auth/testing';
+import type { EmailLike } from '@tomu-ai/workers-auth/testing';
+
+// Whatever your provider's "list recent messages" call looks like. Map it once,
+// into the minimal { to, subject, html?, text?, createdAt? } shape.
+const fetchEmails = async (): Promise<EmailLike[]> => {
+  const res = await fetch('https://api.example-mail.test/messages', {
+    headers: { authorization: `Bearer ${env.MAIL_API_KEY}` },
+  });
+  const { data } = (await res.json()) as { data: EmailLike[] };
+  return data;
+};
+
+// 1. Trigger the send.
+await app.fetch(
+  new Request('https://example.com/auth/magic-link', {
+    method: 'POST',
+    headers: { origin: 'https://example.com', 'content-type': 'application/json' },
+    body: JSON.stringify({ email: 'user@example.com' }),
+  }),
+  env,
+);
+
+// 2. Wait for it to land. Polls immediately, then every intervalMs (default
+//    500ms) until timeoutMs (default 10_000ms).
+const email = await waitForEmail(
+  fetchEmails,
+  (m) => m.to === 'user@example.com' && m.subject.includes('Sign in'),
+  { timeoutMs: 15_000, intervalMs: 250 },
+);
+
+// 3. Pull the link out and consume it.
+const link = extractMagicLinkFromEmail(email.html ?? email.text ?? '');
+const token = new URL(link).searchParams.get('token')!;
+
+const jar = await loginForCookies(
+  (req) => app.fetch(req, env),
+  new Request('https://example.com/auth/session', {
+    method: 'POST',
+    headers: { origin: 'https://example.com', 'x-magic-token': token },
+  }),
+);
+
+const me = await app.fetch(
+  new Request('https://example.com/api/me', { headers: { cookie: cookieHeader(jar) } }),
+  env,
+);
+```
+
+A real template holds more than one URL — a logo, a help link, an unsubscribe
+footer — so `extractMagicLinkFromEmail` doesn't take the first match. It ranks
+every `http(s)` URL in the body and returns the best one: a token-ish query
+parameter first (`token`, `magic_token`, `magicToken`, `verify-token`,
+`magiclink` — case and `-`/`_` are normalised away), then an auth-looking path
+for `/verify/<token>` style links, then document order. It also decodes `&amp;`,
+which is how an HTML body spells `&`, and trims trailing sentence punctuation
+off a plain-text link.
+
+If your links don't look like that, replace the scan outright:
+
+```ts
+// A custom scheme, a token in an attribute, a host that must match exactly —
+// options.pattern is used as-is, and capture group 1 wins if the pattern has one.
+extractMagicLinkFromEmail(email.html!, { pattern: /href="(https:\/\/app\.example\.com\/go\?[^"]+)"/ });
+```
+
+Both helpers throw rather than returning `null` or `undefined`: a test can't
+continue without the link, and the messages name what was searched — the body
+length for a failed extraction, the poll count and the size of the last fetch
+for a timeout. That last pair separates the two failures that otherwise look
+identical: `last fetch returned 0 email(s)` means nothing was delivered (look at
+the sending side), while a non-zero count means mail arrived but your predicate
+never matched (look at the subject or recipient you're matching on).
+
+`waitForEmail` sleeps via the global `setTimeout` and measures with `Date.now()`,
+so vitest's fake timers drive it and your suite doesn't spend the real timeout
+waiting:
+
+```ts
+vi.useFakeTimers();
+const pending = waitForEmail(fetchEmails, (m) => m.to === 'user@example.com');
+await vi.advanceTimersByTimeAsync(500); // second poll
+await expect(pending).resolves.toMatchObject({ to: 'user@example.com' });
+```
 
 ### D1 migrations in your own test suite
 
