@@ -27,6 +27,17 @@ import {
 } from './middleware.js';
 import type { AuthUser, Session } from './types.js';
 
+/**
+ * Key for SDK-recorded facts about how a session was authenticated
+ * (`emailVerifiedAt`, `deviceId`). Deliberately a module-private symbol that
+ * the package's public entry points do not export: `POST /pin` trusts
+ * `emailVerifiedAt`, so application code must not be able to mint it — not
+ * even by accident. First-party modules (`deviceAuth`) import it directly.
+ */
+export const INTERNAL_AUTH_META: unique symbol = Symbol('workers-auth.internal-auth-meta');
+
+export type InternalAuthMeta = { emailVerifiedAt?: number; deviceId?: string };
+
 export type CreateSessionOptions = {
   scope?: Session['scope'];
   meta?: Record<string, unknown>;
@@ -35,6 +46,17 @@ export type CreateSessionOptions = {
    * to let this function look it up.
    */
   previousSession?: Session | null;
+  /**
+   * `'cookie'` (default) sets the session and CSRF cookies. `'bearer'` sets no
+   * cookies and does not touch the request's cookie session: the caller hands
+   * `bearerSessionToken(session.sid)` to the client itself, and only
+   * `sessionBearer()` will accept the result.
+   */
+  transport?: 'cookie' | 'bearer';
+  /** Per-session lifetime override. Both values together, same rules as `SessionConfig`. */
+  ttl?: { idleTtlSec: number; absoluteTtlSec: number };
+  /** See {@link INTERNAL_AUTH_META}. Not settable through the public API. */
+  [INTERNAL_AUTH_META]?: InternalAuthMeta;
 };
 
 /**
@@ -66,8 +88,23 @@ export async function createSessionFor(
     );
   }
 
-  const previous =
-    options.previousSession !== undefined
+  const bearer = options.transport === 'bearer';
+  const internal = options[INTERNAL_AUTH_META];
+  const ttl = options.ttl ?? config.session;
+  if (
+    !Number.isFinite(ttl.idleTtlSec) ||
+    ttl.idleTtlSec <= 0 ||
+    !Number.isFinite(ttl.absoluteTtlSec) ||
+    ttl.absoluteTtlSec < ttl.idleTtlSec
+  ) {
+    throw new TypeError('createSession: ttl needs positive idleTtlSec <= absoluteTtlSec');
+  }
+
+  // A bearer session lives beside whatever cookie session the request has;
+  // rotating that one out is only meaningful for a cookie login.
+  const previous = bearer
+    ? null
+    : options.previousSession !== undefined
       ? options.previousSession
       : (await readCookieSession(c, config)).session;
   if (previous) {
@@ -82,19 +119,24 @@ export async function createSessionFor(
     // see the `AuthMeta.rateLimitId` doc comment.
     rateLimitId: user.rateLimitId,
     ...(config.storeUserClaims ? { claims: user.claims } : {}),
+    ...(bearer ? { transport: 'bearer' as const } : {}),
+    ...(internal?.emailVerifiedAt !== undefined ? { emailVerifiedAt: internal.emailVerifiedAt } : {}),
+    ...(internal?.deviceId !== undefined ? { deviceId: internal.deviceId } : {}),
   };
 
   const session = await config.store.create({
     userId: user.id,
     subjectType: user.subjectType,
-    idleTtlSec: config.session.idleTtlSec,
-    absoluteTtlSec: config.session.absoluteTtlSec,
+    idleTtlSec: ttl.idleTtlSec,
+    absoluteTtlSec: ttl.absoluteTtlSec,
     ...(options.scope ? { scope: options.scope } : {}),
     meta: { ...(options.meta ?? {}), [AUTH_META_KEY]: authMeta },
   });
 
-  const maxAgeSec = Math.max(1, Math.ceil((session.absoluteExpiresAt - config.clock()) / 1000));
-  setSessionCookies(c, config, session.sid, issueCsrfToken(), maxAgeSec);
+  if (!bearer) {
+    const maxAgeSec = Math.max(1, Math.ceil((session.absoluteExpiresAt - config.clock()) / 1000));
+    setSessionCookies(c, config, session.sid, issueCsrfToken(), maxAgeSec);
+  }
 
   config.onEvent({
     type: 'session.created',

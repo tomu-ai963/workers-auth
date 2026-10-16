@@ -21,6 +21,7 @@
     "dist",
     "migrations",
     "LICENSE",
+    "THIRD_PARTY_NOTICES",
     "README.md",
     "SECURITY.md"
   ],
@@ -40,6 +41,14 @@
     "./api-key": {
       "types": "./dist/api-key.d.ts",
       "import": "./dist/api-key.js"
+    },
+    "./session-bearer": {
+      "types": "./dist/session-bearer.d.ts",
+      "import": "./dist/session-bearer.js"
+    },
+    "./device-auth": {
+      "types": "./dist/device-auth.d.ts",
+      "import": "./dist/device-auth.js"
     },
     "./store/kv": {
       "types": "./dist/store/kv.d.ts",

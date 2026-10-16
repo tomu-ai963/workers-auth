@@ -6,6 +6,11 @@ const TABLES = [
   'auth_user_revocations',
   'auth_magic_link_tokens',
   'auth_api_keys',
+  'auth_email_codes',
+  'auth_trusted_devices',
+  'auth_credentials',
+  'auth_login_guards',
+  'auth_rate_limits',
 ];
 
 /**

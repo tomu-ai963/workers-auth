@@ -296,3 +296,59 @@ export async function waitForEmail(
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// ---------------------------------------------------------------------------
+// Email-code helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * N digits standing alone — not part of a longer number, and not a CSS hex
+ * colour (`#123456`), which is the usual false positive in an HTML email.
+ */
+function emailCodePattern(digits: number): RegExp {
+  return new RegExp(`(?<![\\d#])\\d{${digits}}(?!\\d)`, 'g');
+}
+
+/**
+ * Pulls the 6-digit code out of a delivered `deviceAuth` email body (HTML or
+ * plain text).
+ *
+ * Markup is stripped first (`<style>`/`<script>` blocks entirely, then tags),
+ * so attribute values and styles cannot supply a candidate. If more than one
+ * *distinct* 6-digit number is left — an order number in the footer, say —
+ * this throws rather than guess: a test that passes by picking the wrong one
+ * would be worse than one that fails. Pass `options.pattern` (capture group 1
+ * if it has one) to point at the code exactly.
+ */
+export function extractEmailCodeFromEmail(
+  body: string,
+  options: { pattern?: RegExp; digits?: 6 | 8 } = {},
+): string {
+  if (options.pattern) {
+    const pattern = options.pattern.global
+      ? new RegExp(options.pattern.source, options.pattern.flags.replace(/g/g, ''))
+      : options.pattern;
+    const match = pattern.exec(body);
+    if (!match) {
+      throw new Error(
+        `extractEmailCodeFromEmail: options.pattern ${String(options.pattern)} did not match in body (length: ${body.length})`,
+      );
+    }
+    return (match[1] ?? match[0]).trim();
+  }
+
+  const text = body
+    .replace(/<(style|script)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
+    .replace(/<[^>]*>/g, ' ');
+  const digits = options.digits ?? 6;
+  const found = new Set(Array.from(text.matchAll(emailCodePattern(digits)), (m) => m[0]));
+  if (found.size === 0) {
+    throw new Error(`extractEmailCodeFromEmail: no ${digits}-digit code found in body (length: ${body.length})`);
+  }
+  if (found.size > 1) {
+    throw new Error(
+      `extractEmailCodeFromEmail: ${found.size} different ${digits}-digit numbers in body; pass options.pattern to pick one`,
+    );
+  }
+  return found.values().next().value as string;
+}

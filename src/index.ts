@@ -226,6 +226,7 @@ export {
   getOptionalUser,
   getSession,
   getUser,
+  isBearerSession,
   readCookieSession,
   resolveRequestAuth,
   sessionToUser,
@@ -233,6 +234,7 @@ export {
   verifyProviders,
   type AuthEvent,
   type AuthMeta,
+  type DeviceAuthEvent,
   type MiddlewareOptions,
   type ResolvedAuthConfig,
 } from './middleware.js';

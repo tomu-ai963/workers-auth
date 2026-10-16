@@ -130,8 +130,8 @@ server header is what makes it hold regardless of what's in between.
 
 ### Secret handling
 
-- Every stored credential (session id, magic-link token, API key secret) is
-  stored as SHA-256 hex and compared with `timingSafeEqual` over fixed-length
+- Every stored credential (session id, magic-link token, API key secret,
+  trusted-device secret) is stored as SHA-256 hex and compared with `timingSafeEqual` over fixed-length
   digests, or `secretEquals` (hash-then-compare) when the input length is
   attacker-controlled.
 - An unknown API key id still hashes the presented secret and still runs the
@@ -249,6 +249,111 @@ Single use and confined to the callback route — the two properties that make a
 magic link safe to email. Both are explained at length in the
 [README](./README.md#magiclink-store-sendtoken-ttlsec), because both were the
 subject of confirmed findings; see below.
+
+### PIN / trusted device / email code (`deviceAuth`)
+
+- **Nothing secret at rest.** Email codes are `HMAC-SHA256(key, email \n code)`;
+  device secrets (32 random bytes) are `sha256`; PINs are
+  `PBKDF2-SHA256(HMAC(pepper, pin), 16-byte salt)` with a per-credential salt.
+  The HMAC key and the pepper are HKDF-derived from one app secret, with
+  distinct `info` labels so neither reveals the other or the secret. A secret
+  that is short or obviously low-entropy is refused at construction.
+- **The pepper is the real protection for a 6-digit PIN.** 10^6 PINs fall to
+  brute force at any PBKDF2 cost once the table *and* the pepper leak; the
+  pepper keeps a table-only leak useless. That is why the iteration count is
+  configurable (Free-plan CPU limits) without changing the security argument.
+- **Codes:** 6 (or, opt-in, 8) digits from `crypto.getRandomValues` with
+  rejection sampling (no modulo bias), 10-minute lifetime, single use
+  (`DELETE ... RETURNING`, so of two correct submissions racing exactly one
+  wins), 5 attempts per code. Comparison is constant time over fixed-length
+  HMAC hex.
+- **Guessing budget per address, not per code.** A resend inside the first
+  code's lifetime keeps the attempts already used (and cannot extend that
+  lifetime), and every address has a cap of 10 failed verifications per fixed
+  24 h window across all of its codes — 10 per window, so up to 20 within 24 h
+  when they straddle a window boundary. The cap is reserved *before* a code is
+  checked and given back on success, or when there was no live code to check
+  (none, expired, or its attempts used up — nothing was compared, so nothing
+  is charged). A slot is only taken while one is free; a verify refused at the
+  cap leaves the count untouched, so a burst of concurrent verifies can
+  neither overshoot the cap nor fill it without real wrong guesses. A request that presents
+  a valid trusted device registered to the address is counted against that
+  device's own budget (`maxFailuresPerDevice`, default 10 per window) instead,
+  so the owner of a device can still verify — and unlock a PIN — when someone
+  else has spent the address's budget. See Known limits for the residual risk
+  in numbers and for the lock-out trade-off.
+- **Attempts are reserved before they are checked.** The 10-per-address (and
+  per-device), 5-per-code and 3-per-account limits each move their counter in
+  the same single statement that checks it (`UPSERT ... DO UPDATE ... WHERE
+  count < max RETURNING`, `UPDATE ... WHERE attempts < max RETURNING`, `UPSERT ... DO UPDATE ... WHERE
+  failed_count < max AND locked_at IS NULL RETURNING`), *before* the hash is
+  compared. Twenty concurrent wrong PINs run at most three verifications;
+  fifteen concurrent wrong codes get at most ten checked (with the per-code
+  limit raised so the address cap is what binds). Both are tested, as is a
+  burst of 20 or 40 verifies with no code leaving the budget untouched.
+- **A PIN is only ever checked alongside a valid trusted device,** and the
+  failure counter is only touched after that device has been proven. Someone
+  who merely knows an address cannot lock that account's PIN login.
+- **No CPU for unauthenticated callers.** A missing, tampered, revoked or
+  expired device token, a locked account, or an account without a PIN is
+  answered *before* any PBKDF2 runs. There is deliberately no dummy derivation:
+  equalising timing would mean letting anyone make the Worker spend ~100 ms of
+  CPU per request.
+- **Locked means locked.** While locked, a right and a wrong PIN produce the
+  identical `401 {"error":"email_verification_required"}` — the same answer as
+  an unknown device — because the PIN is never compared at all. Time does not
+  unlock; only a successful email code does (a magic-link login does not).
+- **No account enumeration at `/email/start`.** The response, and the call to
+  `sendCode`, are the same whether or not the address has an account; the
+  account is only looked up (`resolveUser`) after a correct code. Apps must not
+  branch inside `sendCode` on account existence (documented on the option).
+- **Rate limits:** 60 s cooldown and 5 codes/hour per address (per device for
+  a request presenting one of the address's trusted devices), 20 starts per IP
+  per hour; verifies and PIN logins are capped per IP too. IPv4 is keyed per
+  address, IPv6 per **/64** (one subscriber typically holds a whole /64), and
+  only `CF-Connecting-IP` is read — never `X-Forwarded-For`. Per-address keys
+  use the app's `normalizeEmail`, so an app that folds `+tags` / dots folds the
+  limits too. All of these apply to every address equally, so a `429` says
+  nothing about whether an account exists. Optional: `botCheck` (Turnstile etc.)
+  before `/email/start`, `/email/verify` and `/pin/login`, failing closed;
+  `circuitBreaker` (off by default) on `/email/verify`, counting only
+  verifications that compared a live code, attempts and failures in one row
+  and one fixed window.
+- **PIN changes require a fresh email code** (default: within 10 minutes). The
+  freshness fact (`emailVerifiedAt`) is written under a module-private symbol
+  that the package's entry points do not export, so neither application code
+  nor any other provider can mint it; a PIN-login session never has it.
+- **Weak PINs** are refused at enrolment: fewer than 3 distinct digits, runs
+  (wrapping 9→0), palindromes, repeated blocks, doubled digits, two keypad
+  lines, and the six-digit entries of a public common-password list; dates
+  optionally. Apps can add their own rule.
+- **Devices** slide 90 days from last use, end 365 days after registration
+  regardless, and can be revoked individually, all at once, or by the device
+  itself (`/device/forget`).
+- **Revoking a device ends its sessions.** Sessions minted on a device record
+  it, and `deviceBoundSessionStore` checks that device on every `get()` (cookie
+  and bearer alike), refusing and deleting the session once the device is
+  revoked or expired. "Revoke all devices" and `revokeOtherDevicesOnChange` also
+  call `revokeAllForUser()`, which reaches sessions that have no device. Both
+  prerequisites are checked when `deviceAuth()` is constructed. Only the exact
+  object `deviceBoundSessionStore()` returned counts as device-bound (a
+  `WeakSet` registry, not an inheritable marker), and the cookie middleware and
+  `sessionBearer()` refuse a session carrying a device id that they read
+  through any other store — so `Object.create(wrapped)`, an app wrapper over
+  it, or a second `createAuth()` on the same table cannot skip the check.
+- **CSRF (cookie transport):** every POST requires a same-origin (or
+  `trustedOrigins`) `Origin`, and once a CSRF cookie exists, the double-submit
+  header too — the device cookie is an ambient credential, so a cross-site
+  `POST /pin/login` is rejected before it can log in *or* count a failure.
+- **Bearer and cookie sessions do not cross over.** `sessionBearer()` accepts
+  only sessions minted with `transport: 'bearer'`, and the cookie path refuses
+  them. Bearer sessions are short-lived (12 h, no sliding) because page JS can
+  read them.
+- **Bounded input.** Request bodies are capped at 4 KB, by `Content-Length`
+  and by counting the stream, before any JSON parsing.
+- **Secret rotation:** every hash records the `keyId` of the secret that made
+  it; `previousSecrets` keep old rows verifiable and PINs are re-hashed under
+  the current secret on their next success. See the README for the procedure.
 
 ### SQL
 
@@ -430,14 +535,80 @@ containing `\r\n` could inject arbitrary header lines.
 **Fix**: both are checked against a control-character/`;`-free pattern and
 `serializeCookie` throws if either fails it.
 
+## Fixed findings (2026-10 review of `deviceAuth`)
+
+Each P0 was first reproduced as a test against the pre-fix code
+(`31af0a7`), where it failed; the same tests pass after the fix
+(`test/device-auth-p0-regression.test.ts`).
+
+- **[Fixed, was P0] Email codes could be brute-forced across resends.** A
+  resend reset the 5-attempt budget, so one address allowed 25 guesses/hour
+  indefinitely (≈ 20 %/year). Now: attempts carry over within the first code's
+  lifetime, and a per-address cap (10 failures / 24 h, reserved before
+  checking) spans all codes. 8-digit codes are available.
+- **[Fixed, was P0] Revoking a device did not end its sessions.** A thief's
+  session survived `/devices/:id/revoke`, `revoke-all` and
+  `revokeOtherDevicesOnChange`. Now: device-bound sessions are checked against
+  their device on every request, and the bulk revocations also call
+  `revokeAllForUser()`; `deviceAuth()` refuses a configuration that lacks
+  either.
+- **[Fixed, was P1] Per-IP limits were per IPv6 address.** Now per /64; a
+  `botCheck` hook and an optional `circuitBreaker` were added, and the residual
+  risk is stated in numbers (Known limits 10).
+- **[Fixed, P2]** `normalizeEmail` option; extended weak-PIN rules and list;
+  bearer sessions refused on the cookie path; `emailVerifiedAt` moved behind a
+  module-private symbol; `sendCode` / `onSendError` caveats; secret entropy
+  check; 4 KB body cap; `deviceLabel` escaping and `getClientIp` caveats
+  documented; `requireClientIp` option.
+
+## Fixed findings (2026-10 re-review of `deviceAuth`)
+
+The P1 was first reproduced as a test against the pre-fix code (`f16066c`),
+where it failed; it passes after the fix
+(`test/device-auth-lockout.test.ts`, "verification test E").
+
+- **[Fixed, was P1] The per-address failure cap locked owners out.** Anyone
+  who knew an address could spend its 10-failure budget (a verify with no
+  code at all was charged), and a user whose PIN was locked then had no way
+  to get the email code that unlocks it for 24 h. Now: a verify with no live
+  code (none, expired, attempts used up) is not charged; a request presenting
+  a valid trusted device of the address uses that device's own budget
+  (`emailCode.maxFailuresPerDevice`, plus per-device resend cooldown and
+  hourly cap at `/email/start`) instead of the address's; `botCheck` can also
+  guard `/email/verify`. What the cap still stops is listed in Known limits 14.
+- **[Fixed, P2] Fixed-window wording.** The caps are per fixed window: 10 per
+  window, up to 20 across a window boundary within 24 h. Docs now say so.
+- **[Fixed, P2] The device-bound store could be stepped around.** The marker
+  was an inherited property, so `Object.create(wrapped)` with its own `get()`
+  passed the check. Now a `WeakSet` registry, and session readers refuse
+  device-bound sessions read through unregistered stores.
+- **[Fixed, P2] Circuit-breaker counting.** No-live-code verifies counted as
+  failures, and attempts and failures were two rows that could sit in
+  different windows. Now only checked verifications count, both counters are
+  one row in one window, and the README gives the number of IPs needed to
+  open it.
+- **[Fixed, P2] SecLists attribution.** Its MIT notice ships in
+  `THIRD_PARTY_NOTICES`.
+- **[Fixed, was P1 — found re-checking `2491bdc`] A burst of no-code verifies
+  filled the budget.** The failure slot was taken unconditionally and a
+  request refused at the cap did not give it back, so requests that arrived
+  before earlier ones had been refunded stayed counted: 20 parallel verifies
+  with no code ever sent locked an address for 24 h. The slot is now taken by
+  a conditional statement that changes nothing at the cap (address and device
+  budgets alike).
+
 ## Known limits
 
 Read these before shipping.
 
 1. **The JWKS refetch rate limit is per isolate**, as noted above. Configure
    `cache: { kv }` to reduce cross-isolate network pressure further.
-2. **No rate limiting.** This package does not throttle `POST /session`,
-   `magicLink.start()` or API key verification. Put a limiter in front of them.
+2. **No rate limiting outside `deviceAuth`.** This package does not throttle
+   `POST /session`, `magicLink.start()` or API key verification. Put a limiter
+   in front of them. `deviceAuth` has its own limits (see above); its per-IP
+   limits are skipped when no client IP is available (`CF-Connecting-IP` is
+   always set on Cloudflare, so this only affects non-Cloudflare setups) unless
+   `requireClientIp: true`, which refuses such requests instead.
 3. **`storeUserClaims` duplicates identity data** into the session record, where
    it goes stale. Off by default; only the subject's email, provider name, and
    `rateLimitId` are persisted (under `meta.__auth`) regardless — see
@@ -467,6 +638,72 @@ Read these before shipping.
    value is an acceptable trade for not adding a third KV key per API key. The
    revocation flag itself has no such race — see
    [Fixed findings](#fixed-findings-2026-08-review) below.
+9. **A bearer session token is readable by page JavaScript.** In
+   `deviceAuth`'s `transport: 'response'` mode, an XSS on the frontend can
+   exfiltrate the session token and the device token. The session token is
+   short-lived (12 h default) and the device token alone is useless without
+   the PIN, but the app owns where both are stored and must treat XSS as
+   account compromise. Use `transport: 'cookie'` wherever the layout allows.
+10. **A 6-digit email code is still guessable at scale.** After the 2026-10
+    fixes the budget is at most **10 failed guesses per address per fixed
+    24 h window** (so up to 20 inside 24 h across a window boundary, but no
+    more than 10 per window on average over a year), plus
+    `maxFailuresPerDevice` per window for whoever holds one of the address's
+    trusted devices:
+    - one targeted address: ≤ 3,650 guesses/year → ≈ **0.37 % per year**
+      (8-digit codes: ≈ 0.0037 %);
+    - a spray across N registered addresses by an attacker with unlimited IPs
+      (a botnet, many /64s): 10·N guesses/day → N = 1,000 ≈ 0.01 expected
+      takeovers/day (≈ 3–4 a year); N = 100,000 ≈ 1 a day;
+    - from one IPv4 address or IPv6 /64 (60 verifies/hour): ≤ 1,440
+      guesses/day ≈ 0.0014 expected takeovers/day.
+    Every guess needs a code to exist, so each also lands an email in the
+    target's inbox. For larger user bases use `botCheck` (Turnstile) on
+    `/email/start`, `emailCode.digits: 8` (÷100), and consider
+    `circuitBreaker`.
+11. **PBKDF2 at the default 100,000 iterations costs ~146 ms of CPU** per PIN
+    check (measured locally in workerd), which exceeds the Workers Free plan's
+    10 ms limit. Free-plan apps should lower `pin.iterations`; the pepper, not
+    the iteration count, carries the security argument (see above). The local
+    workerd used for this measurement accepted 100,001 iterations; the 100,000
+    cap is Cloudflare's documented production limit and is enforced by
+    `deviceAuth()` at construction regardless.
+12. **The lockout is per account and shared across devices.** Anyone holding
+    *one* of an account's trusted devices can lock the PIN login for all of
+    them with three wrong guesses. Recovery is an email code.
+13. **`auth_trusted_devices.email` and `auth_email_codes.email` store the
+    normalised address in the clear**, as `auth_magic_link_tokens` already did.
+    It is an identifier, not a credential; audit events use a fingerprint.
+14. **The per-address failure cap is a lock anyone can pull.** Ten wrong
+    guesses against live codes for an address — requesting the codes (which
+    land in the owner's inbox) and guessing, nothing more than the address
+    needed — make `/email/start` and `/email/verify` answer `429` for it until
+    the window ends, for every request that does not present a trusted device
+    of the address. Until then that stops: logging in on a new device;
+    unlocking a locked PIN; setting or changing the PIN; app routes behind
+    `requireFreshEmailAuth()`; and any login for a user with no PIN or whose
+    trusted device has expired or been revoked. PIN login on a trusted device
+    is unaffected, and **a user holding a valid trusted device of the address
+    recovers through that device's own budget** (`maxFailuresPerDevice`),
+    which someone without the device cannot spend. Users with no live trusted
+    device have to wait. This is the deliberate price of bounding guesses per
+    address; tune `emailCode.maxFailuresPerEmail` / `failureWindowSec` if it is
+    wrong for your product.
+15. **`circuitBreaker` is a global off-switch for email login** in the hands of
+    whoever can generate `minFailures` failures. It is off by default for that
+    reason. With default per-IP limits that takes at least
+    `⌈minFailures / 120⌉` IPv4 addresses or IPv6 /64s for a window of up to an
+    hour (README has the derivation) — and one client if client IPs are
+    missing and `requireClientIp` is off.
+16. **Device-bound sessions cost one extra D1 read per request** for sessions
+    minted on a trusted device. `deviceBoundSessionStore` wraps the inner store
+    through its prototype; a custom store that relies on `this`-bound private
+    class fields (`#x`) would need its own wrapper — placed *inside*
+    `deviceBoundSessionStore()`, since a wrapper outside it is no longer
+    recognised as device-bound and its device-bound sessions are refused.
+17. **Weak-PIN detection is a blocklist, not a guarantee.** It covers the
+    structural patterns and common picks listed above; birthdays are only
+    refused with `pin.rejectDateLike`.
 
 ## Reporting
 
