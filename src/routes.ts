@@ -35,6 +35,20 @@ export type CreateSessionOptions = {
    * to let this function look it up.
    */
   previousSession?: Session | null;
+  /**
+   * `'cookie'` (default) sets the session and CSRF cookies. `'bearer'` sets no
+   * cookies and does not touch the request's cookie session: the caller hands
+   * `bearerSessionToken(session.sid)` to the client itself, and only
+   * `sessionBearer()` will accept the result.
+   */
+  transport?: 'cookie' | 'bearer';
+  /** Per-session lifetime override. Both values together, same rules as `SessionConfig`. */
+  ttl?: { idleTtlSec: number; absoluteTtlSec: number };
+  /**
+   * SDK-recorded facts about how this session was authenticated. Written into
+   * `meta.__auth`, where application metadata cannot reach.
+   */
+  authMeta?: { emailVerifiedAt?: number; deviceId?: string };
 };
 
 /**
@@ -66,8 +80,22 @@ export async function createSessionFor(
     );
   }
 
-  const previous =
-    options.previousSession !== undefined
+  const bearer = options.transport === 'bearer';
+  const ttl = options.ttl ?? config.session;
+  if (
+    !Number.isFinite(ttl.idleTtlSec) ||
+    ttl.idleTtlSec <= 0 ||
+    !Number.isFinite(ttl.absoluteTtlSec) ||
+    ttl.absoluteTtlSec < ttl.idleTtlSec
+  ) {
+    throw new TypeError('createSession: ttl needs positive idleTtlSec <= absoluteTtlSec');
+  }
+
+  // A bearer session lives beside whatever cookie session the request has;
+  // rotating that one out is only meaningful for a cookie login.
+  const previous = bearer
+    ? null
+    : options.previousSession !== undefined
       ? options.previousSession
       : (await readCookieSession(c, config)).session;
   if (previous) {
@@ -82,19 +110,26 @@ export async function createSessionFor(
     // see the `AuthMeta.rateLimitId` doc comment.
     rateLimitId: user.rateLimitId,
     ...(config.storeUserClaims ? { claims: user.claims } : {}),
+    ...(bearer ? { transport: 'bearer' as const } : {}),
+    ...(options.authMeta?.emailVerifiedAt !== undefined
+      ? { emailVerifiedAt: options.authMeta.emailVerifiedAt }
+      : {}),
+    ...(options.authMeta?.deviceId !== undefined ? { deviceId: options.authMeta.deviceId } : {}),
   };
 
   const session = await config.store.create({
     userId: user.id,
     subjectType: user.subjectType,
-    idleTtlSec: config.session.idleTtlSec,
-    absoluteTtlSec: config.session.absoluteTtlSec,
+    idleTtlSec: ttl.idleTtlSec,
+    absoluteTtlSec: ttl.absoluteTtlSec,
     ...(options.scope ? { scope: options.scope } : {}),
     meta: { ...(options.meta ?? {}), [AUTH_META_KEY]: authMeta },
   });
 
-  const maxAgeSec = Math.max(1, Math.ceil((session.absoluteExpiresAt - config.clock()) / 1000));
-  setSessionCookies(c, config, session.sid, issueCsrfToken(), maxAgeSec);
+  if (!bearer) {
+    const maxAgeSec = Math.max(1, Math.ceil((session.absoluteExpiresAt - config.clock()) / 1000));
+    setSessionCookies(c, config, session.sid, issueCsrfToken(), maxAgeSec);
+  }
 
   config.onEvent({
     type: 'session.created',

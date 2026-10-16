@@ -9,9 +9,10 @@ design constraint, not a default — see [Non-goals](#non-goals).
 
 ```
 Layer 1  SessionStore   persistence        kv / d1 / + revocation list
-Layer 2  AuthProvider   identity proof     neon / magic-link / api-key
+Layer 2  AuthProvider   identity proof     neon / magic-link / api-key / session-bearer
 Layer 3  middleware     Hono integration   auth.middleware(), auth.routes()
 Layer 4  client         browser            createAuthClient()
+         deviceAuth     PIN + trusted device + email code (own routes, built on layers 1-3)
 ```
 
 ## Install
@@ -32,8 +33,10 @@ verification or D1 code:
 | `@tomu-ai/workers-auth/neon` | `neonAuth`, `clearJwksCache` |
 | `@tomu-ai/workers-auth/magic-link` | `magicLink`, `kvMagicLinkStore`, `d1MagicLinkStore` |
 | `@tomu-ai/workers-auth/api-key` | `apiKey`, `issueApiKey`, `kvApiKeyStore`, `d1ApiKeyStore` |
+| `@tomu-ai/workers-auth/session-bearer` | `sessionBearer`, `bearerSessionToken`, `readBearerSession`, `revokeBearerSession` |
+| `@tomu-ai/workers-auth/device-auth` | `deviceAuth`, `d1DeviceAuthStore`, `isWeakPin`, `pinCredential` — see [PIN + trusted device + email code](#pin--trusted-device--email-code-deviceauth) |
 | `@tomu-ai/workers-auth/client` | `createAuthClient` |
-| `@tomu-ai/workers-auth/testing` | `readCookieJar`, `cookieHeader`, `loginForCookies`, `waitForEmail`, `extractMagicLinkFromEmail` — see [Testing your integration](#testing-your-integration) |
+| `@tomu-ai/workers-auth/testing` | `readCookieJar`, `cookieHeader`, `loginForCookies`, `waitForEmail`, `extractMagicLinkFromEmail`, `extractEmailCodeFromEmail` — see [Testing your integration](#testing-your-integration) |
 
 ## Choosing a session store
 
@@ -376,6 +379,257 @@ const provider = apiKey({ store, env: 'live' });     // -> subjectType: 'service
 Only `sha256(secret)` is stored, and comparison is timing-safe — including for
 unknown key ids, which take the same path.
 
+## PIN + trusted device + email code (`deviceAuth`)
+
+Magic links are safe but tedious: every login is a trip to the inbox. This
+module replaces that with:
+
+1. **New device** — enter an email address, type the 6-digit code that arrives,
+   and the device becomes *trusted*. If the account has no PIN yet, set one.
+2. **Trusted device** — the PIN alone.
+3. **3 wrong PINs in a row** — the account's PIN login stops until an email
+   code succeeds again.
+
+It is not an `AuthProvider` (a PIN login has a failure counter as a side
+effect, and its "verify your email" answer cannot be expressed as `null`). It
+mounts its own routes and mints sessions through the `Auth` you give it, so the
+session store, cookie config and `onEvent` are shared with everything else.
+The existing `magicLink` provider is untouched and can run alongside it; a
+magic-link login does **not** lift a PIN lockout — only an email code does.
+
+```
+new device:     POST /email/start {email}       -> 200 {ok}   (same answer for every address)
+                POST /email/verify {email,code} -> session + trusted device, {pinSet}
+                POST /pin {pin}                 (needs an email verification < 10 min old)
+trusted device: POST /pin/login {pin}           -> session
+                  no / revoked / expired device -> 401 email_verification_required  (no PBKDF2 run)
+                  account locked                -> 401 email_verification_required  (no PBKDF2 run)
+                  wrong PIN                     -> 401 {invalid_pin, attemptsRemaining}
+                  3rd wrong PIN                 -> 401 email_verification_required  (account locked)
+```
+
+Apply `migrations/0006_device_auth.sql`. The store is D1 only:
+`deviceAuth()` refuses a store that does not declare `atomic: true`, because
+every limit here (5 tries per code, 3 PIN failures, resend cooldowns) must hold
+under concurrent requests and KV cannot do that.
+
+### Choosing a transport
+
+`transport` is required — there is no default, because the right answer
+depends on where the frontend lives.
+
+| | `'cookie'` | `'response'` |
+| --- | --- | --- |
+| layout | frontend and API on the **same site** | frontend and API on **different sites** (`*.github.io` and `*.workers.dev`) |
+| device token | `__Host-device` cookie, HttpOnly / Secure / SameSite=Lax | `deviceToken` in the JSON body; send back as `x-device-token` |
+| session | the usual cookie session | `sessionToken` (`wsb_…`) in the body; send as `Authorization: Bearer` |
+| CSRF | Origin check on every POST (+ double-submit once a CSRF cookie exists) | not applicable — nothing is ambient |
+
+Why `'response'` exists at all: across sites, the session cookie is a
+third-party cookie and Safari (among others) drops it, so a cookie-only setup
+silently fails after login. In `'response'` mode the **app** decides where to
+keep the two tokens (this SDK's own client still keeps nothing — see
+[Non-goals](#non-goals)). A bearer session is readable by page JS, so it is
+short-lived: **12 hours, no sliding** by default (`bearerSessionTtlSec`). The
+device token lives up to a year, so getting a new session on a trusted device
+costs only the PIN.
+
+### Same-site setup (`transport: 'cookie'`)
+
+```ts
+import { Hono } from 'hono';
+import { createAuth, getUser } from '@tomu-ai/workers-auth';
+import { d1SessionStore } from '@tomu-ai/workers-auth/store/d1';
+import { d1DeviceAuthStore, deviceAuth } from '@tomu-ai/workers-auth/device-auth';
+
+type Env = { DB: D1Database; DEVICE_AUTH_SECRET: string; DEVICE_AUTH_PREVIOUS_SECRETS?: string };
+
+const app = new Hono<{ Bindings: Env }>();
+
+function build(env: Env) {
+  const auth = createAuth({ providers: [], store: d1SessionStore(env.DB) });
+  const device = deviceAuth({
+    auth,
+    store: d1DeviceAuthStore(env.DB),
+    transport: 'cookie',
+    secret: env.DEVICE_AUTH_SECRET,
+    previousSecrets: env.DEVICE_AUTH_PREVIOUS_SECRETS?.split(',').filter(Boolean),
+    sendCode: (email, code) => sendWithYourProvider(email, `Your code: ${code}`),
+    resolveUser: (email) => findOrCreateUser(env.DB, email), // -> AuthUser | null
+  });
+  return { auth, device };
+}
+
+// Built per request because bindings only exist inside one. The sub-app is
+// mounted under the same prefix so it sees the full path.
+app.all('/auth/device/*', (c) =>
+  new Hono().route('/auth/device', build(c.env).device.routes()).fetch(c.req.raw, c.env),
+);
+app.use('/api/*', (c, next) => build(c.env).auth.middleware()(c, next));
+app.get('/api/me', (c) => c.json(getUser(c)));
+```
+
+The page calls these with `credentials: 'include'` and echoes the `__Host-csrf`
+cookie as `x-csrf-token` (what `createAuthClient` already does for `/session`).
+
+### Cross-site setup (`transport: 'response'`)
+
+```ts
+import { cors } from 'hono/cors';
+import { sessionBearer } from '@tomu-ai/workers-auth/session-bearer';
+
+function build(env: Env) {
+  const store = d1SessionStore(env.DB);
+  // sessionBearer() is what lets auth.middleware() accept `Authorization: Bearer wsb_…`.
+  const auth = createAuth({ providers: [sessionBearer({ store })], store });
+  const device = deviceAuth({ auth, store: d1DeviceAuthStore(env.DB), transport: 'response', /* ...as above */ });
+  return { auth, device };
+}
+
+app.use('*', cors({
+  origin: 'https://you.github.io',
+  allowHeaders: ['content-type', 'authorization', 'x-device-token'],
+  allowMethods: ['GET', 'POST'],
+}));
+```
+
+```ts
+// frontend (sketch)
+const r = await fetch(`${API}/auth/device/email/verify`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ email, code }),
+}).then((res) => res.json());
+// r.deviceToken (only when a new device was registered), r.sessionToken, r.pinSet
+```
+
+### Routes
+
+All mounted under wherever you `route()` them (`/auth/device` above). Every
+response is `Cache-Control: no-store`.
+
+| route | needs | does |
+| --- | --- | --- |
+| `POST /email/start` `{email}` | — | sends a code; always `200 {ok:true}`, or `429 {rate_limited, retryAfterSec}` |
+| `POST /email/verify` `{email, code, trustDevice?, deviceLabel?}` | — | session + trusted device (`trustDevice` defaults to `true`), clears a PIN lockout; `{ok, user, pinSet, device, deviceToken?, sessionToken?}` |
+| `POST /pin` `{pin}` | session from an email code < `freshEmailAuthSec` old | sets / changes / resets the PIN (one path for all three) |
+| `GET /pin/status` | session | `{pinSet}` |
+| `POST /pin/login` `{pin}` | device token | session |
+| `GET /devices` | session | `{devices, currentDeviceId}` |
+| `POST /devices/:deviceId/revoke` | session | revokes one of *your* devices |
+| `POST /devices/revoke-all` | session | revokes all of your devices |
+| `POST /device/forget` | device token | revokes this device, clears its cookie |
+| `POST /logout` | session | ends the session (cookie or bearer); the device stays trusted |
+
+Also on the returned object: `requireFreshEmailAuth(maxAgeSec?)` (middleware
+for your own sensitive routes), `listDevices`, `revokeDevice`,
+`revokeAllDevices`, `hasPin`.
+
+### Options worth knowing
+
+| option | default | |
+| --- | --- | --- |
+| `device.idleTtlSec` | 90 days | extended from every PIN login |
+| `device.absoluteTtlSec` | 365 days | from registration; never extended |
+| `pin.iterations` | 100,000 | PBKDF2-SHA256; 1,000–100,000 (Workers' cap) |
+| `pin.maxAttempts` | 3 | consecutive failures before lockout, per account |
+| `pin.isWeakPin` | — | extra rule, on top of the built-in one |
+| `pin.revokeOtherDevicesOnChange` | `false` | revoke the account's other devices when an existing PIN is replaced |
+| `emailCode.ttlSec` / `.maxAttempts` | 600 / 5 | |
+| `freshEmailAuthSec` | 600 | how recent an email code `POST /pin` needs |
+| `bearerSessionTtlSec` | 43,200 (12 h) | `'response'` only |
+| `limits.resendCooldownSec` | 60 | per address |
+| `limits.codesPerEmailPerHour` | 5 | |
+| `limits.startsPerIpPerHour` / `verifiesPerIpPerHour` / `pinLoginsPerIpPerHour` | 20 / 60 / 60 | skipped when `getClientIp` returns null |
+
+Rejected as weak: one repeated digit (`000000`), ascending/descending runs
+(`123456`, `987654`), repeated 2- or 3-digit blocks (`121212`, `123123`),
+doubled/tripled digits (`112233`, `111222`) and a short list of common picks.
+
+### PIN cost: the pepper is what protects a 6-digit PIN
+
+There are only 10^6 PINs. If the credentials table leaks *without* the secret,
+nothing can be brute-forced, because every PIN is HMAC'd with a pepper derived
+from `secret` before PBKDF2 sees it. If both leak, PBKDF2 barely helps — even
+at 100,000 iterations, trying all 10^6 PINs takes seconds to minutes on a single
+GPU. **The pepper is the defence; the iteration count is a second line.**
+
+Measured cost of one PBKDF2-SHA256 derivation in workerd (local
+`@cloudflare/vitest-pool-workers`, on the development machine — production CPUs
+will differ):
+
+| iterations | ms per PIN check |
+| --- | --- |
+| 100,000 (default) | 146.3 |
+| 50,000 | 73.5 |
+| 10,000 | 12.3 |
+
+That is well over the Workers **Free plan's 10 ms CPU** limit. **Apps on the
+Free plan may lower `pin.iterations`** — it is safe to do so precisely because
+the pepper, not the iteration count, is what stands between a leaked table and
+the PINs. A PIN is re-hashed at the configured cost on its next successful
+login, so the setting can be changed at any time. PBKDF2 only ever runs for a
+caller holding a valid trusted device on an unlocked account, so an
+unauthenticated caller cannot make the Worker spend it.
+
+### The secret, and rotating it
+
+`secret` (at least 32 characters) is the only key material. HKDF-SHA256 derives
+an email-code HMAC key and the PIN pepper from it, plus a public `keyId` stored
+next to every hash (`material.pepperVer` for PINs, `key_id` for codes) so each
+row is verified with the secret that made it.
+
+```bash
+# generate it yourself and store it as a Worker secret; never commit the value
+openssl rand -base64 48
+npx wrangler secret put DEVICE_AUTH_SECRET
+```
+
+For local development put it in `.dev.vars` (keep `.dev.vars*` gitignored).
+
+Rotation, without logging anyone out:
+
+1. Set the new value as `DEVICE_AUTH_SECRET` and move the old one into
+   `DEVICE_AUTH_PREVIOUS_SECRETS` (comma-separated), passed as `previousSecrets`.
+2. Deploy. New codes and PINs use the new secret; old ones still verify, and
+   each PIN is re-hashed under the new secret on its next successful login.
+3. Wait as long as you want returning users to be covered — the device idle
+   lifetime (90 days) is a natural bound. Email codes need only 10 minutes.
+4. Remove the old secret from `DEVICE_AUTH_PREVIOUS_SECRETS` and deploy.
+   PINs that were never re-hashed stop verifying; those users get
+   `invalid_pin` and recover with an email code and a new PIN.
+
+If the secret leaked, skip the waiting: rotate without `previousSecrets`, and
+every PIN has to be reset via email.
+
+### Adding passkeys later
+
+Login methods are `CredentialKind`s stored in one generic `auth_credentials`
+table (`type IN ('pin','passkey')` — `passkey` is in the CHECK already, because
+SQLite cannot alter a CHECK without rebuilding the table). Failure counting and
+lockout (`auth_login_guards`), trusted devices, audit events and session
+minting are kind-agnostic. Adding passkeys means adding one part:
+
+```
+   shared, unchanged: auth_login_guards / auth_trusted_devices / onEvent / createSession
+                                         ^
+              CredentialKind<TInput> { type, requiresTrustedDevice, enroll, verify }
+                       +-----------------+------------------+
+              pinCredential()                     passkeyCredential()   (later)
+              requiresTrustedDevice: true         requiresTrustedDevice: false
+              (this release)                      + its own challenge-table migration and routes
+```
+
+No existing table, column or route changes. (The part itself — WebAuthn
+attestation/assertion verification — is substantial; whether it can keep this
+package at zero runtime dependencies is a decision for that time.)
+
+### Cleanup
+
+`d1DeviceAuthStore(db).cleanup(now?)` deletes expired codes and devices,
+revoked devices and credentials, and rate-limit windows older than a day. Run it
+from a cron trigger.
+
 ## Layer 4: the client
 
 ```ts
@@ -397,7 +651,10 @@ the moment it settles, so nothing is remembered.
 
 Deliberately absent, and not up for addition:
 
-- web storage of any kind (`localStorage` / `sessionStorage` / IndexedDB)
+- web storage of any kind (`localStorage` / `sessionStorage` / IndexedDB) in
+  this SDK's client. (`deviceAuth`'s cross-site mode hands tokens to the app;
+  where the app keeps them is the app's decision, not something this package
+  does for it.)
 - cross-tab state broadcasting
 - background token refresh loops
 - response caching in the client
@@ -423,6 +680,7 @@ D1 migrations ship in `migrations/`. Apply only what you use:
 | `0003_magic_link_tokens.sql` | `d1MagicLinkStore` |
 | `0004_api_keys.sql` | `d1ApiKeyStore` |
 | `0005_user_revocations.sql` | `revocationList` — "log out everywhere" |
+| `0006_device_auth.sql` | `d1DeviceAuthStore` — email codes, trusted devices, credentials, lockout, rate limits |
 
 ```bash
 npx wrangler d1 migrations apply <db> --local
@@ -600,6 +858,27 @@ const pending = waitForEmail(fetchEmails, (m) => m.to === 'user@example.com');
 await vi.advanceTimersByTimeAsync(500); // second poll
 await expect(pending).resolves.toMatchObject({ to: 'user@example.com' });
 ```
+
+#### Email-code flows (`deviceAuth`)
+
+Same shape, one helper different: `extractEmailCodeFromEmail(body)` returns the
+6-digit code. It strips `<style>`/`<script>` blocks and tags first, ignores
+digits that are part of a longer number or a `#123456` colour, and **throws if
+more than one distinct 6-digit number is left** (an order number in the footer,
+say) rather than guess — pass `{ pattern }` to point at the code exactly.
+
+```ts
+import { extractEmailCodeFromEmail, waitForEmail } from '@tomu-ai/workers-auth/testing';
+
+const email = await waitForEmail(fetchEmails, (m) => m.to === 'user@example.com');
+const code = extractEmailCodeFromEmail(email.text ?? email.html ?? '');
+// POST /auth/device/email/verify { email: 'user@example.com', code }
+```
+
+In `transport: 'cookie'` mode the device cookie arrives in `Set-Cookie` like the
+session cookie, so `readCookieJar` / `cookieHeader` carry it forward unchanged.
+In `'response'` mode, read `deviceToken` / `sessionToken` from the JSON body and
+send them back as `x-device-token` / `Authorization: Bearer`.
 
 ### D1 migrations in your own test suite
 

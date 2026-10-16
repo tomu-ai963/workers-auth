@@ -233,6 +233,7 @@ export {
   verifyProviders,
   type AuthEvent,
   type AuthMeta,
+  type DeviceAuthEvent,
   type MiddlewareOptions,
   type ResolvedAuthConfig,
 } from './middleware.js';

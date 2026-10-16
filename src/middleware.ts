@@ -61,6 +61,17 @@ export type AuthMeta = {
    * `user.rateLimitId` would see it only on the login request itself.
    */
   rateLimitId?: string;
+  /**
+   * `'bearer'` for a session minted to be presented as `Authorization: Bearer`
+   * (see `sessionBearer()`); absent for an ordinary cookie session. The bearer
+   * provider refuses any session without it, so a cookie session id can never
+   * be replayed as a bearer token.
+   */
+  transport?: 'bearer';
+  /** epoch ms of the email-code verification that minted this session, if any. */
+  emailVerifiedAt?: number;
+  /** The trusted device this session was minted on, if any. Public handle, not a secret. */
+  deviceId?: string;
 };
 
 export type ResolvedSessionConfig = {
@@ -91,7 +102,26 @@ export type AuthEvent =
   | { type: 'session.created'; userId: string; subjectType: SubjectType; sidFingerprint: string }
   | { type: 'session.revoked'; sidFingerprint: string }
   | { type: 'auth.failed'; reason: string; provider?: string }
-  | { type: 'csrf.failed'; reason: string };
+  | { type: 'csrf.failed'; reason: string }
+  | DeviceAuthEvent;
+
+/**
+ * Events from `deviceAuth()`. Never carries a PIN, code, or device secret:
+ * addresses appear only as `emailFingerprint` (12 hex chars of sha256), and
+ * `deviceId` is the device's public handle.
+ */
+export type DeviceAuthEvent =
+  | { type: 'email_code.sent'; emailFingerprint: string }
+  | { type: 'email_code.failed'; emailFingerprint: string; reason: string }
+  | { type: 'email_code.verified'; userId: string; emailFingerprint: string }
+  | { type: 'rate_limited'; scope: string }
+  | { type: 'device.registered'; userId: string; deviceId: string }
+  | { type: 'device.revoked'; userId: string; deviceId?: string; count?: number; reason: string }
+  | { type: 'pin.set'; userId: string; replaced: boolean }
+  | { type: 'pin.login.succeeded'; userId: string; deviceId: string }
+  | { type: 'pin.login.failed'; reason: string; userId?: string; deviceId?: string; failedCount?: number }
+  | { type: 'pin.locked'; userId: string; deviceId: string }
+  | { type: 'pin.unlocked'; userId: string };
 
 export type MiddlewareOptions = {
   /** Allow unauthenticated requests through instead of answering 401. */

@@ -130,8 +130,8 @@ server header is what makes it hold regardless of what's in between.
 
 ### Secret handling
 
-- Every stored credential (session id, magic-link token, API key secret) is
-  stored as SHA-256 hex and compared with `timingSafeEqual` over fixed-length
+- Every stored credential (session id, magic-link token, API key secret,
+  trusted-device secret) is stored as SHA-256 hex and compared with `timingSafeEqual` over fixed-length
   digests, or `secretEquals` (hash-then-compare) when the input length is
   attacker-controlled.
 - An unknown API key id still hashes the presented secret and still runs the
@@ -249,6 +249,66 @@ Single use and confined to the callback route — the two properties that make a
 magic link safe to email. Both are explained at length in the
 [README](./README.md#magiclink-store-sendtoken-ttlsec), because both were the
 subject of confirmed findings; see below.
+
+### PIN / trusted device / email code (`deviceAuth`)
+
+- **Nothing secret at rest.** Email codes are `HMAC-SHA256(key, email \n code)`;
+  device secrets (32 random bytes) are `sha256`; PINs are
+  `PBKDF2-SHA256(HMAC(pepper, pin), 16-byte salt)` with a per-credential salt.
+  The HMAC key and the pepper are HKDF-derived from one app secret, with
+  distinct `info` labels so neither reveals the other or the secret.
+- **The pepper is the real protection for a 6-digit PIN.** 10^6 PINs fall to
+  brute force at any PBKDF2 cost once the table *and* the pepper leak; the
+  pepper keeps a table-only leak useless. That is why the iteration count is
+  configurable (Free-plan CPU limits) without changing the security argument.
+- **Codes:** 6 digits from `crypto.getRandomValues` with rejection sampling (no
+  modulo bias), 10-minute lifetime, single use (`DELETE ... RETURNING`, so of two
+  correct submissions racing exactly one wins), 5 attempts per code. Comparison
+  is constant time over fixed-length HMAC hex.
+- **Attempts are reserved before they are checked.** Both the 5-per-code and
+  the 3-per-account limits move the counter in the same single statement that
+  checks it (`UPDATE ... WHERE attempts < max RETURNING` /
+  `UPSERT ... DO UPDATE ... WHERE failed_count < max AND locked_at IS NULL
+  RETURNING`), *before* the hash is compared, and a PIN success gives the
+  budget back. Twenty concurrent wrong PINs therefore run at most three
+  verifications; this is tested, as is the email-code equivalent.
+- **A PIN is only ever checked alongside a valid trusted device,** and the
+  failure counter is only touched after that device has been proven. Someone
+  who merely knows an address cannot lock that account out.
+- **No CPU for unauthenticated callers.** A missing, tampered, revoked or
+  expired device token, a locked account, or an account without a PIN is
+  answered *before* any PBKDF2 runs. There is deliberately no dummy derivation:
+  equalising timing would mean letting anyone make the Worker spend ~100 ms of
+  CPU per request.
+- **Locked means locked.** While locked, a right and a wrong PIN produce the
+  identical `401 {"error":"email_verification_required"}` — the same answer as
+  an unknown device — because the PIN is never compared at all. Time does not
+  unlock; only a successful email code does (a magic-link login does not).
+- **No account enumeration at `/email/start`.** The response, and the call to
+  `sendCode`, are the same whether or not the address has an account; the
+  account is only looked up (`resolveUser`) after a correct code.
+- **Resend limits:** 60 s cooldown and 5 codes/hour per address, 20 starts per
+  IP per hour; verifies and PIN logins are also capped per IP. These apply to
+  every address equally, so a `429` says nothing about whether an account exists.
+- **PIN changes require a fresh email code** (default: within 10 minutes). A
+  PIN-login session can never change the PIN, so a stolen device + PIN cannot
+  be turned into a permanent takeover by re-keying it.
+- **Weak PINs** (repeated digits, runs, repeated blocks, doubled digits, a short
+  common list) are refused at enrolment; apps can add their own rule.
+- **Devices** slide 90 days from last use, end 365 days after registration
+  regardless, and can be revoked individually, all at once, or by the device
+  itself (`/device/forget`).
+- **CSRF (cookie transport):** every POST requires a same-origin (or
+  `trustedOrigins`) `Origin`, and once a CSRF cookie exists, the double-submit
+  header too — the device cookie is an ambient credential, so a cross-site
+  `POST /pin/login` is rejected before it can log in *or* count a failure.
+- **Bearer sessions (response transport)** are only accepted by
+  `sessionBearer()` when minted with `transport: 'bearer'`, so a cookie session
+  id cannot be replayed as a bearer token. They are short-lived (12 h, no
+  sliding) because page JS can read them.
+- **Secret rotation:** every hash records the `keyId` of the secret that made
+  it; `previousSecrets` keep old rows verifiable and PINs are re-hashed under
+  the current secret on their next success. See the README for the procedure.
 
 ### SQL
 
@@ -436,8 +496,11 @@ Read these before shipping.
 
 1. **The JWKS refetch rate limit is per isolate**, as noted above. Configure
    `cache: { kv }` to reduce cross-isolate network pressure further.
-2. **No rate limiting.** This package does not throttle `POST /session`,
-   `magicLink.start()` or API key verification. Put a limiter in front of them.
+2. **No rate limiting outside `deviceAuth`.** This package does not throttle
+   `POST /session`, `magicLink.start()` or API key verification. Put a limiter
+   in front of them. `deviceAuth` has its own limits (see above); its per-IP
+   limits are skipped when no client IP is available (`CF-Connecting-IP` is
+   always set on Cloudflare, so this only affects non-Cloudflare test setups).
 3. **`storeUserClaims` duplicates identity data** into the session record, where
    it goes stale. Off by default; only the subject's email, provider name, and
    `rateLimitId` are persisted (under `meta.__auth`) regardless — see
@@ -467,6 +530,28 @@ Read these before shipping.
    value is an acceptable trade for not adding a third KV key per API key. The
    revocation flag itself has no such race — see
    [Fixed findings](#fixed-findings-2026-08-review) below.
+9. **A bearer session token is readable by page JavaScript.** In
+   `deviceAuth`'s `transport: 'response'` mode, an XSS on the frontend can
+   exfiltrate the session token and the device token. The session token is
+   short-lived (12 h default) and the device token alone is useless without
+   the PIN, but the app owns where both are stored and must treat XSS as
+   account compromise. Use `transport: 'cookie'` wherever the layout allows.
+10. **A resend resets a code's 5-attempt budget.** Each new code to an address
+    replaces the old one along with its attempt count. The per-address limit
+    (5 codes/hour) bounds this to 25 guesses per hour against a 10^6 space.
+11. **PBKDF2 at the default 100,000 iterations costs ~146 ms of CPU** per PIN
+    check (measured locally in workerd), which exceeds the Workers Free plan's
+    10 ms limit. Free-plan apps should lower `pin.iterations`; the pepper, not
+    the iteration count, carries the security argument (see above). The local
+    workerd used for this measurement accepted 100,001 iterations; the 100,000
+    cap is Cloudflare's documented production limit and is enforced by
+    `deviceAuth()` at construction regardless.
+12. **The lockout is per account and shared across devices.** Anyone holding
+    *one* of an account's trusted devices can lock the PIN login for all of
+    them with three wrong guesses. Recovery is an email code.
+13. **`auth_trusted_devices.email` and `auth_email_codes.email` store the
+    normalised address in the clear**, as `auth_magic_link_tokens` already did.
+    It is an identifier, not a credential; audit events use a fingerprint.
 
 ## Reporting
 

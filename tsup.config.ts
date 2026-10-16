@@ -6,6 +6,8 @@ export default defineConfig({
     neon: 'src/providers/neon.ts',
     'magic-link': 'src/providers/magic-link.ts',
     'api-key': 'src/providers/api-key.ts',
+    'session-bearer': 'src/providers/session-bearer.ts',
+    'device-auth': 'src/device-auth/index.ts',
     'store/kv': 'src/store/kv.ts',
     'store/d1': 'src/store/d1.ts',
     client: 'src/client.ts',
