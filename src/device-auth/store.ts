@@ -21,6 +21,13 @@ export type EmailCodeRecord = {
   keyId: string;
   expiresAt: number;
   createdAt: number;
+  /**
+   * Until when a resend keeps the attempts already used. Set to
+   * `createdAt + ttl` for the first code of a window; a resend before this
+   * time inherits both the count and this deadline, so resending can neither
+   * refill the budget nor stretch the window.
+   */
+  attemptsResetAt: number;
 };
 
 export type ReservedEmailCode = {
@@ -71,14 +78,20 @@ export interface DeviceAuthStore {
    * window restarts once `windowMs` has passed since it opened.
    */
   hitRateLimit(bucket: string, windowMs: number, now: number): Promise<{ count: number; windowStart: number }>;
+  /** The current window's count without adding to it (0 when the window has lapsed). */
+  readRateLimit(bucket: string, windowMs: number, now: number): Promise<{ count: number; windowStart: number }>;
+  /** Gives back one hit taken by `hitRateLimit`, if that window is still the current one. */
+  refundRateLimit(bucket: string, windowStart: number): Promise<void>;
 
-  /** Replaces any live code for the address, resetting its attempt count. */
+  /**
+   * Replaces the address's code. Attempts already used carry over while the
+   * stored `attemptsResetAt` is still in the future (see `EmailCodeRecord`).
+   */
   putEmailCode(record: EmailCodeRecord): Promise<void>;
   /** Reserves one attempt on a live, unexhausted code. null = nothing to try. */
   reserveEmailCodeAttempt(email: string, now: number, maxAttempts: number): Promise<ReservedEmailCode | null>;
   /** Deletes the code iff it is still the one that was matched. Exactly one caller wins. */
   consumeEmailCode(email: string, codeHash: string): Promise<boolean>;
-  deleteEmailCode(email: string): Promise<void>;
 
   createDevice(record: DeviceRecord): Promise<void>;
   findDevice(deviceId: string): Promise<DeviceRecord | null>;
@@ -201,16 +214,36 @@ export function d1DeviceAuthStore(
       return { count: row?.count ?? 1, windowStart: row?.window_start ?? now };
     },
 
+    async readRateLimit(bucket, windowMs, now) {
+      const row = await db
+        .prepare(`SELECT count, window_start FROM ${limits} WHERE bucket = ?1 AND window_start > ?2`)
+        .bind(bucket, now - windowMs)
+        .first<{ count: number; window_start: number }>();
+      return { count: row?.count ?? 0, windowStart: row?.window_start ?? now };
+    },
+
+    async refundRateLimit(bucket, windowStart) {
+      await db
+        .prepare(`UPDATE ${limits} SET count = count - 1 WHERE bucket = ?1 AND window_start = ?2 AND count > 0`)
+        .bind(bucket, windowStart)
+        .run();
+    },
+
     async putEmailCode(record) {
       await db
         .prepare(
-          `INSERT INTO ${codes} (email, code_hash, key_id, attempts, expires_at, created_at)
-           VALUES (?1, ?2, ?3, 0, ?4, ?5)
+          `INSERT INTO ${codes} (email, code_hash, key_id, attempts, attempts_reset_at, expires_at, created_at)
+           VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
            ON CONFLICT(email) DO UPDATE SET
-             code_hash = excluded.code_hash, key_id = excluded.key_id, attempts = 0,
-             expires_at = excluded.expires_at, created_at = excluded.created_at`,
+             code_hash = excluded.code_hash,
+             key_id = excluded.key_id,
+             attempts = CASE WHEN attempts_reset_at > excluded.created_at THEN attempts ELSE 0 END,
+             attempts_reset_at = CASE WHEN attempts_reset_at > excluded.created_at
+                                      THEN attempts_reset_at ELSE excluded.attempts_reset_at END,
+             expires_at = excluded.expires_at,
+             created_at = excluded.created_at`,
         )
-        .bind(record.email, record.codeHash, record.keyId, record.expiresAt, record.createdAt)
+        .bind(record.email, record.codeHash, record.keyId, record.attemptsResetAt, record.expiresAt, record.createdAt)
         .run();
     },
 
@@ -232,10 +265,6 @@ export function d1DeviceAuthStore(
         .bind(email, codeHash)
         .first();
       return row !== null;
-    },
-
-    async deleteEmailCode(email) {
-      await db.prepare(`DELETE FROM ${codes} WHERE email = ?1`).bind(email).run();
     },
 
     async createDevice(r) {

@@ -59,10 +59,36 @@ async function deriveKeys(secret: string): Promise<DerivedKeys> {
   return { keyId: toHex(new Uint8Array(idBits)), otpKey, pepperKey };
 }
 
+/** Below this many estimated bits, a secret is refused. */
+export const MIN_SECRET_ENTROPY_BITS = 96;
+
+/**
+ * Shannon entropy of the string's own character distribution, times its
+ * length. Not a measure of how the secret was generated — only a cheap way to
+ * catch the obvious placeholders (`'a'.repeat(32)`, `changemechangeme…`,
+ * a word typed four times) before they reach production. 32 random hex
+ * characters score ~115; `openssl rand -base64 48` scores ~350.
+ */
+export function estimateEntropyBits(value: string): number {
+  const counts = new Map<string, number>();
+  for (const ch of value) counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  let h = 0;
+  for (const n of counts.values()) {
+    const p = n / value.length;
+    h -= p * Math.log2(p);
+  }
+  return h * value.length;
+}
+
 /** Throws without echoing the value — a secret must never reach an error message. */
 export function assertSecret(value: unknown, label: string): asserts value is string {
   if (typeof value !== 'string' || value.length < MIN_SECRET_LENGTH) {
     throw new TypeError(`deviceAuth: ${label} must be a string of at least ${MIN_SECRET_LENGTH} characters`);
+  }
+  if (new Set(value).size < 10 || estimateEntropyBits(value) < MIN_SECRET_ENTROPY_BITS) {
+    throw new TypeError(
+      `deviceAuth: ${label} looks low-entropy; generate it with \`openssl rand -base64 48\``,
+    );
   }
 }
 

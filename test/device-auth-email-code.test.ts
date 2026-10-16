@@ -148,10 +148,11 @@ describe('POST /email/verify', () => {
     }
     const res = await call(h, client(), 'POST', '/auth/device/email/verify', { email: EMAIL, code });
     expect(res.status).toBe(401);
-    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_email_codes').first('n')).toBe(0);
+    // The exhausted row is kept (not deleted) so a resend cannot reset its budget.
+    expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
   });
 
-  it('counts concurrent wrong guesses: 10 in parallel still exhaust the code', async () => {
+  it('counts concurrent wrong guesses: 10 in parallel exhaust the code and the address budget', async () => {
     const h = setup();
     await call(h, client(), 'POST', '/auth/device/email/start', { email: EMAIL });
     const code = h.lastCode(EMAIL);
@@ -160,8 +161,11 @@ describe('POST /email/verify', () => {
       Array.from({ length: 10 }, () => call(h, client(), 'POST', '/auth/device/email/verify', { email: EMAIL, code: wrong })),
     );
     expect(results.every((r) => r.status === 401)).toBe(true);
+    expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
+    // All 10 reserved a failure against the address, so the 11th is refused unchecked.
     const res = await call(h, client(), 'POST', '/auth/device/email/verify', { email: EMAIL, code });
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(429);
+    expect(res.body).toMatchObject({ error: 'rate_limited' });
   });
 
   it('lets exactly one of two concurrent correct submissions through', async () => {

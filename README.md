@@ -34,7 +34,7 @@ verification or D1 code:
 | `@tomu-ai/workers-auth/magic-link` | `magicLink`, `kvMagicLinkStore`, `d1MagicLinkStore` |
 | `@tomu-ai/workers-auth/api-key` | `apiKey`, `issueApiKey`, `kvApiKeyStore`, `d1ApiKeyStore` |
 | `@tomu-ai/workers-auth/session-bearer` | `sessionBearer`, `bearerSessionToken`, `readBearerSession`, `revokeBearerSession` |
-| `@tomu-ai/workers-auth/device-auth` | `deviceAuth`, `d1DeviceAuthStore`, `isWeakPin`, `pinCredential` — see [PIN + trusted device + email code](#pin--trusted-device--email-code-deviceauth) |
+| `@tomu-ai/workers-auth/device-auth` | `deviceAuth`, `d1DeviceAuthStore`, `deviceBoundSessionStore`, `isWeakPin`, `pinCredential` — see [PIN + trusted device + email code](#pin--trusted-device--email-code-deviceauth) |
 | `@tomu-ai/workers-auth/client` | `createAuthClient` |
 | `@tomu-ai/workers-auth/testing` | `readCookieJar`, `cookieHeader`, `loginForCookies`, `waitForEmail`, `extractMagicLinkFromEmail`, `extractEmailCodeFromEmail` — see [Testing your integration](#testing-your-integration) |
 
@@ -393,8 +393,9 @@ module replaces that with:
 It is not an `AuthProvider` (a PIN login has a failure counter as a side
 effect, and its "verify your email" answer cannot be expressed as `null`). It
 mounts its own routes and mints sessions through the `Auth` you give it, so the
-session store, cookie config and `onEvent` are shared with everything else.
-The existing `magicLink` provider is untouched and can run alongside it; a
+session store, cookie config and `onEvent` are shared with everything else
+(there is no separate `onEvent` option — events go to `createAuth`'s). The
+existing `magicLink` provider is untouched and can run alongside it; a
 magic-link login does **not** lift a PIN lockout — only an email code does.
 
 ```
@@ -410,8 +411,26 @@ trusted device: POST /pin/login {pin}           -> session
 
 Apply `migrations/0006_device_auth.sql`. The store is D1 only:
 `deviceAuth()` refuses a store that does not declare `atomic: true`, because
-every limit here (5 tries per code, 3 PIN failures, resend cooldowns) must hold
-under concurrent requests and KV cannot do that.
+every limit here (5 tries per code, 10 failures per address per day, 3 PIN
+failures, resend cooldowns) must hold under concurrent requests and KV cannot
+do that.
+
+### Three things `deviceAuth()` checks at construction
+
+It throws, rather than letting a gap surface during an incident, unless:
+
+1. **The session store is wrapped with `deviceBoundSessionStore(store,
+   deviceStore)`.** Every session minted on a trusted device records that
+   device; the wrapper checks the device on every `get()` (one D1 point read,
+   only for such sessions) and refuses — and deletes — the session once the
+   device is revoked, expired, or no longer the account's. That is what makes
+   revoking a device end the sessions on it, for cookie and bearer sessions
+   alike. Use the same D1 database for both stores.
+2. **The session store can `revokeAllForUser()`** (`canRevokeAllForUser`):
+   `d1SessionStore`, or `kvSessionStore` with a `revocationList`.
+   "Revoke all devices" and `revokeOtherDevicesOnChange` end every session of
+   the account with it.
+3. **Every `sessionBearer()` provider reads that same wrapped store.**
 
 ### Choosing a transport
 
@@ -432,7 +451,9 @@ keep the two tokens (this SDK's own client still keeps nothing — see
 [Non-goals](#non-goals)). A bearer session is readable by page JS, so it is
 short-lived: **12 hours, no sliding** by default (`bearerSessionTtlSec`). The
 device token lives up to a year, so getting a new session on a trusted device
-costs only the PIN.
+costs only the PIN. The two kinds never cross over: a bearer session id sent
+as the session cookie is refused, and a cookie session id sent as a bearer
+token is refused.
 
 ### Same-site setup (`transport: 'cookie'`)
 
@@ -440,17 +461,19 @@ costs only the PIN.
 import { Hono } from 'hono';
 import { createAuth, getUser } from '@tomu-ai/workers-auth';
 import { d1SessionStore } from '@tomu-ai/workers-auth/store/d1';
-import { d1DeviceAuthStore, deviceAuth } from '@tomu-ai/workers-auth/device-auth';
+import { d1DeviceAuthStore, deviceAuth, deviceBoundSessionStore } from '@tomu-ai/workers-auth/device-auth';
 
 type Env = { DB: D1Database; DEVICE_AUTH_SECRET: string; DEVICE_AUTH_PREVIOUS_SECRETS?: string };
 
 const app = new Hono<{ Bindings: Env }>();
 
 function build(env: Env) {
-  const auth = createAuth({ providers: [], store: d1SessionStore(env.DB) });
+  const devices = d1DeviceAuthStore(env.DB);
+  const sessions = deviceBoundSessionStore(d1SessionStore(env.DB), devices);
+  const auth = createAuth({ providers: [], store: sessions });
   const device = deviceAuth({
     auth,
-    store: d1DeviceAuthStore(env.DB),
+    store: devices,
     transport: 'cookie',
     secret: env.DEVICE_AUTH_SECRET,
     previousSecrets: env.DEVICE_AUTH_PREVIOUS_SECRETS?.split(',').filter(Boolean),
@@ -479,13 +502,15 @@ import { cors } from 'hono/cors';
 import { sessionBearer } from '@tomu-ai/workers-auth/session-bearer';
 
 function build(env: Env) {
-  const store = d1SessionStore(env.DB);
+  const devices = d1DeviceAuthStore(env.DB);
+  const sessions = deviceBoundSessionStore(d1SessionStore(env.DB), devices);
   // sessionBearer() is what lets auth.middleware() accept `Authorization: Bearer wsb_…`.
-  const auth = createAuth({ providers: [sessionBearer({ store })], store });
-  const device = deviceAuth({ auth, store: d1DeviceAuthStore(env.DB), transport: 'response', /* ...as above */ });
+  const auth = createAuth({ providers: [sessionBearer({ store: sessions })], store: sessions });
+  const device = deviceAuth({ auth, store: devices, transport: 'response', /* ...as above */ });
   return { auth, device };
 }
 
+// A fixed origin, no credentials: nothing here relies on cookies.
 app.use('*', cors({
   origin: 'https://you.github.io',
   allowHeaders: ['content-type', 'authorization', 'x-device-token'],
@@ -506,45 +531,111 @@ const r = await fetch(`${API}/auth/device/email/verify`, {
 ### Routes
 
 All mounted under wherever you `route()` them (`/auth/device` above). Every
-response is `Cache-Control: no-store`.
+response is `Cache-Control: no-store`. Request bodies are JSON, at most
+**4 KB** (`413 payload_too_large` otherwise).
 
 | route | needs | does |
 | --- | --- | --- |
-| `POST /email/start` `{email}` | — | sends a code; always `200 {ok:true}`, or `429 {rate_limited, retryAfterSec}` |
-| `POST /email/verify` `{email, code, trustDevice?, deviceLabel?}` | — | session + trusted device (`trustDevice` defaults to `true`), clears a PIN lockout; `{ok, user, pinSet, device, deviceToken?, sessionToken?}` |
-| `POST /pin` `{pin}` | session from an email code < `freshEmailAuthSec` old | sets / changes / resets the PIN (one path for all three) |
+| `POST /email/start` `{email}` | — | sends a code; `200 {ok:true}` for every address, or `429 {rate_limited, retryAfterSec}` |
+| `POST /email/verify` `{email, code, trustDevice?, deviceLabel?}` | — | session + trusted device (`trustDevice` defaults to `true`), clears a PIN lockout; `{ok, user, pinSet, device, deviceToken?, sessionToken?}`. A repeat email login on an already-trusted device of the same account reuses (and extends) that device instead of registering a new one |
+| `POST /pin` `{pin}` | session from an email code < `freshEmailAuthSec` old | sets / changes / resets the PIN (one path for all three). With `revokeOtherDevicesOnChange` and an existing PIN: `{ok, signedOut: true}` — see below |
 | `GET /pin/status` | session | `{pinSet}` |
 | `POST /pin/login` `{pin}` | device token | session |
 | `GET /devices` | session | `{devices, currentDeviceId}` |
-| `POST /devices/:deviceId/revoke` | session | revokes one of *your* devices |
-| `POST /devices/revoke-all` | session | revokes all of your devices |
-| `POST /device/forget` | device token | revokes this device, clears its cookie |
-| `POST /logout` | session | ends the session (cookie or bearer); the device stays trusted |
+| `POST /devices/:deviceId/revoke` | session | revokes one of *your* devices; the sessions minted on it stop working on their next request |
+| `POST /devices/revoke-all` | session | revokes all of your devices **and every session of the account, this one included** |
+| `POST /device/forget` | device token | revokes this device (and so its sessions), clears its cookie |
+| `POST /logout` | session | ends the current session (cookie or bearer); the device stays trusted |
+
+Error bodies: `invalid_request` (400), `invalid_pin_format` / `weak_pin` (400),
+`client_ip_required` (400, only with `requireClientIp`), `invalid_code` (401),
+`invalid_pin` + `attemptsRemaining` (401), `email_verification_required` (401),
+`unauthenticated` (401), `csrf_failed` / `bot_check_failed` (403),
+`payload_too_large` (413), `rate_limited` + `retryAfterSec` (429),
+`temporarily_unavailable` (503, only with `circuitBreaker`).
 
 Also on the returned object: `requireFreshEmailAuth(maxAgeSec?)` (middleware
-for your own sensitive routes), `listDevices`, `revokeDevice`,
-`revokeAllDevices`, `hasPin`.
+for your own sensitive routes), `listDevices`, `revokeDevice` (ends that
+device's sessions), `revokeAllDevices` (ends every session of the account),
+`hasPin`. The subpath also exports `generateEmailCode` (used by the tests),
+`ipRateLimitKey`, `isWeakPin` and `estimateEntropyBits`.
+
+`deviceLabel` (≤ 100 characters) is stored and returned exactly as the client
+sent it. **Escape it when you render it** — it is user input, and an
+unescaped label in a "your devices" page is a stored XSS.
 
 ### Options worth knowing
 
 | option | default | |
 | --- | --- | --- |
-| `device.idleTtlSec` | 90 days | extended from every PIN login |
+| `device.idleTtlSec` | 90 days | extended by every PIN login (and a repeat email login on that device) |
 | `device.absoluteTtlSec` | 365 days | from registration; never extended |
 | `pin.iterations` | 100,000 | PBKDF2-SHA256; 1,000–100,000 (Workers' cap) |
 | `pin.maxAttempts` | 3 | consecutive failures before lockout, per account |
 | `pin.isWeakPin` | — | extra rule, on top of the built-in one |
-| `pin.revokeOtherDevicesOnChange` | `false` | revoke the account's other devices when an existing PIN is replaced |
-| `emailCode.ttlSec` / `.maxAttempts` | 600 / 5 | |
+| `pin.rejectDateLike` | `false` | also refuse DDMMYY / MMDDYY / YYMMDD / YYYYMM / MMYYYY |
+| `pin.revokeOtherDevicesOnChange` | `false` | on replacing an existing PIN: revoke the other devices **and every session of the account**, including the caller's (`signedOut: true`; the current device stays trusted, so it logs in again with the new PIN) |
+| `emailCode.ttlSec` / `.maxAttempts` | 600 / 5 | a resend inside the first code's lifetime keeps the attempts already used |
+| `emailCode.digits` | 6 | 6 or 8 |
+| `emailCode.maxFailuresPerEmail` / `.failureWindowSec` | 10 / 86,400 | failures per address across all its codes — see the trade-off below |
+| `normalizeEmail` | trim + lower-case | the address everything is keyed on |
 | `freshEmailAuthSec` | 600 | how recent an email code `POST /pin` needs |
 | `bearerSessionTtlSec` | 43,200 (12 h) | `'response'` only |
 | `limits.resendCooldownSec` | 60 | per address |
 | `limits.codesPerEmailPerHour` | 5 | |
-| `limits.startsPerIpPerHour` / `verifiesPerIpPerHour` / `pinLoginsPerIpPerHour` | 20 / 60 / 60 | skipped when `getClientIp` returns null |
+| `limits.startsPerIpPerHour` / `verifiesPerIpPerHour` / `pinLoginsPerIpPerHour` | 20 / 60 / 60 | per IPv4 address, per IPv6 **/64** |
+| `getClientIp` | `CF-Connecting-IP` | see below |
+| `requireClientIp` | `false` | `true` refuses requests with no client IP instead of skipping per-IP limits |
+| `botCheck` | — | `(req, 'email_start' \| 'pin_login') => boolean`; false or a throw → `403 bot_check_failed` |
+| `circuitBreaker` | off | `{ minFailures, maxFailureRatio = 0.5, windowSec = 600 }` — see below |
 
-Rejected as weak: one repeated digit (`000000`), ascending/descending runs
-(`123456`, `987654`), repeated 2- or 3-digit blocks (`121212`, `123123`),
-doubled/tripled digits (`112233`, `111222`) and a short list of common picks.
+**The per-address failure cap, and its trade-off.** Ten failed verifications
+for one address within 24 hours (across however many codes) stop *new-device
+login by email for that address for the rest of the 24 hours*: both
+`/email/start` and `/email/verify` answer `429`. Anyone who knows the address
+can trigger this. **PIN login on the user's trusted devices is not affected**,
+so an existing user on their own phone does not notice; a user trying to add a
+new device has to wait. That is the price of capping how many guesses an
+attacker gets against one address: without it, resending kept refilling the
+budget. Successful verifications do not count.
+
+**Normalising addresses.** Everything is keyed on `normalizeEmail(input)`.
+If your accounts treat `a.b+tag@gmail.com` and `ab@gmail.com` as one user, do
+that canonicalisation in `normalizeEmail`, not only inside `resolveUser` —
+otherwise each spelling gets its own limits against the same account.
+
+**`sendCode` and `onSendError`.** `sendCode` is called for every
+valid-looking address; do not branch on whether an account exists (the
+response waits for the send, so a skipped send is visible as a faster
+response). `onSendError` receives whatever your provider threw, which may
+include the request it failed on — recipient, subject, even the body with the
+code. Log a status or error name, not the object.
+
+**`getClientIp`.** On Cloudflare, `CF-Connecting-IP` is set by the edge and a
+client cannot forge it; `X-Forwarded-For` is never read. Behind another proxy
+(a front Worker that builds new requests, or a non-Cloudflare reverse proxy),
+every request may carry the proxy's address and all users share one bucket.
+Then pass a `getClientIp` that reads the header *your proxy sets* — never one a
+client can send — and consider `requireClientIp: true`.
+
+**`botCheck`** runs on `/email/start` before anything is sent or counted, and
+on `/pin/login` before any device or PIN work. Read your Turnstile token from
+the request (a clone) it is given.
+
+**`circuitBreaker`** (off by default): while, within `windowSec`, at least
+`minFailures` email verifications failed and they are at least
+`maxFailureRatio` of all verifications, `/email/verify` answers `503
+temporarily_unavailable` *to everyone*. It slows a distributed guessing run,
+and it also hands whoever can produce that many failures a switch that turns
+email login off — set `minFailures` far above your normal failure volume.
+
+Rejected as weak PINs: fewer than 3 distinct digits (`000000`, `101010`,
+`100000`), runs including ones that wrap round 9→0 (`123456`, `987654`,
+`890123`), palindromes (`123321`), repeated 2- or 3-digit blocks (`121212`,
+`123123`), doubled/tripled digits (`112233`, `111222`), two straight keypad
+lines (`147258`, `159357`, `123654`), and the 179 six-digit numbers in
+SecLists' `10k-most-common.txt` (embedded in the source with its sha256) plus a
+few more. Dates are refused only with `pin.rejectDateLike`.
 
 ### PIN cost: the pepper is what protects a 6-digit PIN
 
@@ -565,19 +656,25 @@ will differ):
 | 10,000 | 12.3 |
 
 That is well over the Workers **Free plan's 10 ms CPU** limit. **Apps on the
-Free plan may lower `pin.iterations`** — it is safe to do so precisely because
-the pepper, not the iteration count, is what stands between a leaked table and
-the PINs. A PIN is re-hashed at the configured cost on its next successful
-login, so the setting can be changed at any time. PBKDF2 only ever runs for a
-caller holding a valid trusted device on an unlocked account, so an
-unauthenticated caller cannot make the Worker spend it.
+Free plan may lower `pin.iterations`** (minimum 1,000) — it is safe to do so
+precisely because the pepper, not the iteration count, is what stands between
+a leaked table and the PINs. A PIN is re-hashed at the configured cost on its
+next successful login, so the setting can be changed at any time. PBKDF2 only
+ever runs for a caller holding a valid trusted device on an unlocked account,
+so an unauthenticated caller cannot make the Worker spend it.
 
 ### The secret, and rotating it
 
-`secret` (at least 32 characters) is the only key material. HKDF-SHA256 derives
-an email-code HMAC key and the PIN pepper from it, plus a public `keyId` stored
-next to every hash (`material.pepperVer` for PINs, `key_id` for codes) so each
-row is verified with the secret that made it.
+`secret` is the only key material. HKDF-SHA256 derives an email-code HMAC key
+and the PIN pepper from it, plus a public `keyId` stored next to every hash
+(`material.pepperVer` for PINs, `key_id` for codes) so each row is verified with
+the secret that made it.
+
+`deviceAuth()` refuses a secret shorter than 32 characters, with fewer than 10
+distinct characters, or whose character-distribution entropy estimate is below
+96 bits (`'a'.repeat(40)`, a word typed four times, `changemechangeme…`). That
+check only catches placeholders — it cannot tell a random string from a
+well-mixed typed one — so **generate the secret**:
 
 ```bash
 # generate it yourself and store it as a Worker secret; never commit the value
@@ -585,7 +682,10 @@ openssl rand -base64 48
 npx wrangler secret put DEVICE_AUTH_SECRET
 ```
 
-For local development put it in `.dev.vars` (keep `.dev.vars*` gitignored).
+On Windows without OpenSSL:
+`[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))`
+in PowerShell does the same. For local development put it in `.dev.vars`
+(keep `.dev.vars*` gitignored).
 
 Rotation, without logging anyone out:
 
@@ -607,8 +707,9 @@ every PIN has to be reset via email.
 Login methods are `CredentialKind`s stored in one generic `auth_credentials`
 table (`type IN ('pin','passkey')` — `passkey` is in the CHECK already, because
 SQLite cannot alter a CHECK without rebuilding the table). Failure counting and
-lockout (`auth_login_guards`), trusted devices, audit events and session
-minting are kind-agnostic. Adding passkeys means adding one part:
+lockout (`auth_login_guards`), trusted devices, device-bound sessions, audit
+events and session minting are kind-agnostic. Adding passkeys means adding one
+part:
 
 ```
    shared, unchanged: auth_login_guards / auth_trusted_devices / onEvent / createSession
@@ -626,9 +727,12 @@ package at zero runtime dependencies is a decision for that time.)
 
 ### Cleanup
 
-`d1DeviceAuthStore(db).cleanup(now?)` deletes expired codes and devices,
-revoked devices and credentials, and rate-limit windows older than a day. Run it
-from a cron trigger.
+`d1DeviceAuthStore(db).cleanup(now?, rateLimitHorizonMs?)` deletes expired codes
+and devices, revoked devices and credentials, and rate-limit windows that
+started more than `rateLimitHorizonMs` ago (default: one day). Run it from a
+cron trigger. **If you raise `emailCode.failureWindowSec` above a day, pass a
+`rateLimitHorizonMs` at least that long**, or cleanup will forget failures the
+cap still needs.
 
 ## Layer 4: the client
 
@@ -862,7 +966,7 @@ await expect(pending).resolves.toMatchObject({ to: 'user@example.com' });
 #### Email-code flows (`deviceAuth`)
 
 Same shape, one helper different: `extractEmailCodeFromEmail(body)` returns the
-6-digit code. It strips `<style>`/`<script>` blocks and tags first, ignores
+6-digit code (`{ digits: 8 }` for `emailCode.digits: 8`). It strips `<style>`/`<script>` blocks and tags first, ignores
 digits that are part of a longer number or a `#123456` colour, and **throws if
 more than one distinct 6-digit number is left** (an order number in the footer,
 say) rather than guess — pass `{ pattern }` to point at the code exactly.
@@ -935,7 +1039,8 @@ pnpm test        # vitest + @cloudflare/vitest-pool-workers (runs on workerd)
 pnpm build       # tsup, ESM + d.ts
 ```
 
-Tests run on real Miniflare KV and D1. Stores, providers and `createAuth` all
+Tests run on real Miniflare KV and D1. The `deviceAuth` suites use 1,000 PBKDF2
+iterations to stay fast; one test exercises the 100,000 default end to end. Stores, providers and `createAuth` all
 accept a `clock` option so expiry behaviour is tested deterministically instead
 of with sleeps. Several tests wrap KV in a gate that can hold a `put` open, so
 races (a `touch()` in flight against a concurrent `revoke()`, two requests

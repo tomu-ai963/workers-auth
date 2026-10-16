@@ -2,7 +2,12 @@ import { env } from 'cloudflare:test';
 import { Hono } from 'hono';
 
 import { randomToken } from '../../src/crypto.js';
-import { d1DeviceAuthStore, deviceAuth, type DeviceAuthOptions } from '../../src/device-auth/index.js';
+import {
+  d1DeviceAuthStore,
+  deviceAuth,
+  deviceBoundSessionStore,
+  type DeviceAuthOptions,
+} from '../../src/device-auth/index.js';
 import { createAuth, getUser, type AuthEvent, type CreateAuthOptions } from '../../src/index.js';
 import { sessionBearer } from '../../src/providers/session-bearer.js';
 import { d1SessionStore } from '../../src/store/d1.js';
@@ -30,7 +35,8 @@ export function setup(
 ) {
   const events: AuthEvent[] = [];
   const sent: Array<{ email: string; code: string }> = [];
-  const sessionStore = d1SessionStore(env.DB, { clock });
+  const store = d1DeviceAuthStore(env.DB, { clock });
+  const sessionStore = deviceBoundSessionStore(d1SessionStore(env.DB, { clock }), store, { clock });
   const auth =
     overrides.auth ??
     createAuth({
@@ -40,7 +46,6 @@ export function setup(
       onEvent: (e) => events.push(e),
       ...authOverrides,
     });
-  const store = d1DeviceAuthStore(env.DB, { clock });
   const device = deviceAuth({
     auth,
     store,
@@ -68,7 +73,7 @@ export function setup(
     return hit.code;
   };
 
-  return { app, auth, device, store, events, sent, lastCode };
+  return { app, auth, device, store, sessionStore, events, sent, lastCode };
 }
 
 export type Client = {

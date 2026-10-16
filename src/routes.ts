@@ -27,6 +27,17 @@ import {
 } from './middleware.js';
 import type { AuthUser, Session } from './types.js';
 
+/**
+ * Key for SDK-recorded facts about how a session was authenticated
+ * (`emailVerifiedAt`, `deviceId`). Deliberately a module-private symbol that
+ * the package's public entry points do not export: `POST /pin` trusts
+ * `emailVerifiedAt`, so application code must not be able to mint it — not
+ * even by accident. First-party modules (`deviceAuth`) import it directly.
+ */
+export const INTERNAL_AUTH_META: unique symbol = Symbol('workers-auth.internal-auth-meta');
+
+export type InternalAuthMeta = { emailVerifiedAt?: number; deviceId?: string };
+
 export type CreateSessionOptions = {
   scope?: Session['scope'];
   meta?: Record<string, unknown>;
@@ -44,11 +55,8 @@ export type CreateSessionOptions = {
   transport?: 'cookie' | 'bearer';
   /** Per-session lifetime override. Both values together, same rules as `SessionConfig`. */
   ttl?: { idleTtlSec: number; absoluteTtlSec: number };
-  /**
-   * SDK-recorded facts about how this session was authenticated. Written into
-   * `meta.__auth`, where application metadata cannot reach.
-   */
-  authMeta?: { emailVerifiedAt?: number; deviceId?: string };
+  /** See {@link INTERNAL_AUTH_META}. Not settable through the public API. */
+  [INTERNAL_AUTH_META]?: InternalAuthMeta;
 };
 
 /**
@@ -81,6 +89,7 @@ export async function createSessionFor(
   }
 
   const bearer = options.transport === 'bearer';
+  const internal = options[INTERNAL_AUTH_META];
   const ttl = options.ttl ?? config.session;
   if (
     !Number.isFinite(ttl.idleTtlSec) ||
@@ -111,10 +120,8 @@ export async function createSessionFor(
     rateLimitId: user.rateLimitId,
     ...(config.storeUserClaims ? { claims: user.claims } : {}),
     ...(bearer ? { transport: 'bearer' as const } : {}),
-    ...(options.authMeta?.emailVerifiedAt !== undefined
-      ? { emailVerifiedAt: options.authMeta.emailVerifiedAt }
-      : {}),
-    ...(options.authMeta?.deviceId !== undefined ? { deviceId: options.authMeta.deviceId } : {}),
+    ...(internal?.emailVerifiedAt !== undefined ? { emailVerifiedAt: internal.emailVerifiedAt } : {}),
+    ...(internal?.deviceId !== undefined ? { deviceId: internal.deviceId } : {}),
   };
 
   const session = await config.store.create({

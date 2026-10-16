@@ -226,6 +226,7 @@ export {
   getOptionalUser,
   getSession,
   getUser,
+  isBearerSession,
   readCookieSession,
   resolveRequestAuth,
   sessionToUser,

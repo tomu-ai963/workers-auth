@@ -64,53 +64,114 @@ export function isPinFormat(pin: unknown): pin is string {
   return typeof pin === 'string' && PIN_RE.test(pin);
 }
 
-/** Commonly chosen PINs that none of the structural rules below catch. */
-const DENYLIST = new Set([
-  '123321',
-  '654456',
-  '147258',
-  '258369',
-  '369258',
-  '159753',
-  '357159',
-  '147852',
-  '963852',
-  '789456',
-  '456123',
-  '102030',
-  '112358',
-  '520520',
-  '520131',
-  '131420',
-]);
+/**
+ * The 179 all-digit, 6-character entries of SecLists'
+ * `Passwords/Common-Credentials/10k-most-common.txt`, in their published
+ * (frequency) order, plus a few well-known picks it does not contain.
+ *
+ * Source: https://github.com/danielmiessler/SecLists (MIT), fetched 2026-10-16,
+ * file sha256 68782d6a4a19a4768d5f15dd66bd534e7a33055cc755411e33f16d18c50fdcce.
+ * These are passwords rather than PINs, but numeric passwords and PINs are
+ * chosen the same way; many of them are also caught by the structural rules
+ * below, and that overlap is deliberate.
+ */
+const COMMON_PINS = new Set(
+  (
+    '123456 696969 111111 654321 123123 666666 121212 131313 000000 112233 222222 777777 987654 232323 ' +
+    '555555 123321 999999 333333 888888 444444 101010 420420 147147 212121 242424 007007 123654 789456 ' +
+    '252525 159753 141414 202020 151515 323232 314159 456789 246810 111222 181818 171717 147258 102030 ' +
+    '363636 343434 454545 424242 272727 098765 159357 147852 191919 321321 010101 565656 362436 456123 ' +
+    '741852 123789 505050 262626 161616 000007 636363 313131 666999 010203 134679 420247 124578 353535 ' +
+    '456456 545454 303030 321654 135790 143143 898989 787878 911911 515151 234567 909090 474747 989898 ' +
+    '012345 196969 142536 282828 404040 727272 200000 369369 292929 987456 969696 100000 525252 311311 ' +
+    '223344 757575 585858 187187 112358 789789 753951 555666 717171 686868 635241 987987 414141 434343 ' +
+    '575757 090909 000001 420000 747474 373737 120676 655321 963852 646464 124038 123457 852456 030303 ' +
+    '767676 616161 515000 656565 626262 336699 951753 494949 383838 456654 818181 222333 102938 737373 ' +
+    '789987 484848 121314 878787 070462 427900 676767 123987 159159 112211 535353 100100 332211 778899 ' +
+    '321123 797979 464646 543210 050505 445566 333666 789654 020202 616913 199999 123098 753159 666777 ' +
+    '902100 222777 456321 515051 606060 159951 142857 789123 393939 868686 567890 ' +
+    // Not in the list above, but common enough to name explicitly.
+    '654456 258369 369258 357159 520520 520131 131420 147369 258456 112112'
+  ).split(' '),
+);
+
+/**
+ * Straight 3-key lines on a phone keypad, both directions:
+ *
+ *     1 2 3
+ *     4 5 6      rows, columns (including 5-8-0) and both diagonals
+ *     7 8 9
+ *       0
+ *
+ * A PIN made of two of these (147258, 159357, 123654, 741852) is a shape,
+ * not a number, and is guessed as one.
+ */
+const KEYPAD_LINES = new Set(
+  ['123', '456', '789', '147', '258', '369', '580', '159', '357'].flatMap((l) => [l, [...l].reverse().join('')]),
+);
+
+export type WeakPinOptions = {
+  /**
+   * Also reject PINs that read as a date: DDMMYY, MMDDYY, YYMMDD, YYYYMM,
+   * MMYYYY. Off by default — it removes roughly a tenth of the PIN space, and
+   * whether a birthday is a "weak" PIN is a product decision.
+   */
+  rejectDateLike?: boolean;
+};
+
+function isMonth(n: number): boolean {
+  return n >= 1 && n <= 12;
+}
+
+function isDay(n: number): boolean {
+  return n >= 1 && n <= 31;
+}
+
+function isDateLike(pin: string): boolean {
+  const two = (i: number) => Number(pin.slice(i, i + 2));
+  const [a, b, c] = [two(0), two(2), two(4)];
+  if (isDay(a) && isMonth(b)) return true; // DDMMYY
+  if (isMonth(a) && isDay(b)) return true; // MMDDYY
+  if (isMonth(b) && isDay(c)) return true; // YYMMDD
+  const year4 = (s: string) => /^(19|20)\d\d$/.test(s);
+  if (year4(pin.slice(0, 4)) && isMonth(c)) return true; // YYYYMM
+  if (isMonth(a) && year4(pin.slice(2))) return true; // MMYYYY
+  return false;
+}
 
 /**
  * Rejects PINs an attacker would try first. Assumes `isPinFormat(pin)`.
  *
- *   - every digit the same           000000, 777777
- *   - ascending / descending runs    123456, 345678, 987654, 012345
- *   - repeating 2- or 3-digit blocks 121212, 123123
- *   - doubled / tripled digits       112233, 111222
- *   - a short list of common picks   147258, 123321, ...
+ *   - fewer than 3 distinct digits     000000, 101010, 112211, 100000
+ *   - runs, wrapping round 9→0         123456, 987654, 890123, 098765
+ *   - palindromes                      123321, 456654
+ *   - repeating 2- or 3-digit blocks   121212, 123123
+ *   - doubled / tripled digits         112233, 111222
+ *   - two keypad lines                 147258, 159357, 123654
+ *   - the common-PIN list above        696969, 314159, 420420, ...
+ *   - dates, when `rejectDateLike`     010190, 199001
  */
-export function isWeakPin(pin: string): boolean {
+export function isWeakPin(pin: string, options: WeakPinOptions = {}): boolean {
   const d = Array.from(pin, (ch) => ch.charCodeAt(0) - 48);
-  if (d.every((x) => x === d[0])) return true;
+  if (new Set(d).size < 3) return true;
 
   let up = true;
   let down = true;
   for (let i = 1; i < d.length; i++) {
-    if ((d[i] as number) !== (d[i - 1] as number) + 1) up = false;
-    if ((d[i] as number) !== (d[i - 1] as number) - 1) down = false;
+    if ((d[i] as number) !== ((d[i - 1] as number) + 1) % 10) up = false;
+    if ((d[i] as number) !== ((d[i - 1] as number) + 9) % 10) down = false;
   }
   if (up || down) return true;
 
+  if ([...pin].reverse().join('') === pin) return true;
   if (pin.slice(0, 2).repeat(3) === pin) return true;
   if (pin.slice(0, 3).repeat(2) === pin) return true;
   if (pin[0] === pin[1] && pin[2] === pin[3] && pin[4] === pin[5]) return true;
   if (pin[0] === pin[1] && pin[1] === pin[2] && pin[3] === pin[4] && pin[4] === pin[5]) return true;
+  if (KEYPAD_LINES.has(pin.slice(0, 3)) && KEYPAD_LINES.has(pin.slice(3))) return true;
+  if (COMMON_PINS.has(pin)) return true;
 
-  return DENYLIST.has(pin);
+  return options.rejectDateLike === true && isDateLike(pin);
 }
 
 type PinMaterial = {

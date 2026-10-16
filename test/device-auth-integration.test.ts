@@ -2,7 +2,12 @@ import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { randomToken } from '../src/crypto.js';
-import { d1DeviceAuthStore, deviceAuth, type DeviceAuthStore } from '../src/device-auth/index.js';
+import {
+  d1DeviceAuthStore,
+  deviceAuth,
+  deviceBoundSessionStore,
+  type DeviceAuthStore,
+} from '../src/device-auth/index.js';
 import { createAuth } from '../src/index.js';
 import { d1MagicLinkStore, magicLink } from '../src/providers/magic-link.js';
 import { sessionBearer } from '../src/providers/session-bearer.js';
@@ -91,7 +96,7 @@ describe('bearer sessions (transport: response)', () => {
   });
 
   it('a bearer login does not rotate out a cookie session on the same request', async () => {
-    const store = d1SessionStore(env.DB, { clock });
+    const store = deviceBoundSessionStore(d1SessionStore(env.DB, { clock }), d1DeviceAuthStore(env.DB), { clock });
     const auth = createAuth({ providers: [sessionBearer({ store })], store, clock });
     const before = await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_sessions').first('n');
     const h = setup({ transport: 'response', auth });
@@ -256,7 +261,9 @@ describe('audit events', () => {
 describe('coexistence with magic links', () => {
   function withMagicLink() {
     const tokens: string[] = [];
-    const sessionStore = d1SessionStore(env.DB, { clock });
+    const sessionStore = deviceBoundSessionStore(d1SessionStore(env.DB, { clock }), d1DeviceAuthStore(env.DB), {
+      clock,
+    });
     const provider = magicLink({
       store: d1MagicLinkStore(env.DB, { clock }),
       sendToken: async (_email, token) => {
@@ -296,7 +303,7 @@ describe('coexistence with magic links', () => {
 
 describe('construction', () => {
   const base = () => {
-    const store = d1SessionStore(env.DB);
+    const store = deviceBoundSessionStore(d1SessionStore(env.DB), d1DeviceAuthStore(env.DB));
     return { auth: createAuth({ providers: [], store }), sendCode: async () => {}, secret: randomToken() };
   };
 

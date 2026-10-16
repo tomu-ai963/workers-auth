@@ -16,7 +16,7 @@
  *     cookie session id, if it ever leaked, cannot be replayed as a bearer.
  */
 
-import { sessionToUser } from '../middleware.js';
+import { isBearerSession, sessionToUser } from '../middleware.js';
 import type { AuthProvider, AuthUser, Session, SessionStore } from '../types.js';
 
 export const BEARER_SESSION_PREFIX = 'wsb_';
@@ -39,11 +39,6 @@ export function readBearerSessionId(req: Request): string | null {
   return /^[A-Za-z0-9_-]{20,}$/.test(sid) ? sid : null;
 }
 
-function isBearerSession(session: Session): boolean {
-  const auth = session.meta?.['__auth'];
-  return typeof auth === 'object' && auth !== null && (auth as { transport?: unknown }).transport === 'bearer';
-}
-
 /** The live bearer session this request presents, or null. */
 export async function readBearerSession(store: SessionStore, req: Request): Promise<Session | null> {
   const sid = readBearerSessionId(req);
@@ -60,6 +55,11 @@ export async function revokeBearerSession(store: SessionStore, req: Request): Pr
   return true;
 }
 
+export interface SessionBearerProvider extends AuthProvider {
+  /** The store this provider reads. `deviceAuth()` checks it is device-bound. */
+  readonly sessionStore: SessionStore;
+}
+
 export type SessionBearerOptions = {
   store: SessionStore;
   name?: string;
@@ -72,13 +72,14 @@ export type SessionBearerOptions = {
  * No sliding window: the middleware only `touch()`es cookie sessions, so a
  * bearer session ends at its idle/absolute expiry regardless of activity.
  */
-export function sessionBearer(options: SessionBearerOptions): AuthProvider {
+export function sessionBearer(options: SessionBearerOptions): SessionBearerProvider {
   const { store, name = 'session-bearer' } = options;
   if (!store || typeof store.get !== 'function') {
     throw new TypeError('sessionBearer: a SessionStore is required');
   }
   return {
     name,
+    sessionStore: store,
     async verify(req: Request): Promise<AuthUser | null> {
       const session = await readBearerSession(store, req);
       return session ? sessionToUser(session) : null;

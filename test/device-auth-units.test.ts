@@ -150,8 +150,8 @@ describe('d1DeviceAuthStore', () => {
 
   it('cleanup removes expired codes/devices, revoked rows and stale rate-limit windows', async () => {
     const s = store();
-    await s.putEmailCode({ email: 'a@example.com', codeHash: 'h', keyId: 'k', expiresAt: NOW - 1, createdAt: NOW - 10 });
-    await s.putEmailCode({ email: 'b@example.com', codeHash: 'h', keyId: 'k', expiresAt: NOW + 1000, createdAt: NOW });
+    await s.putEmailCode({ email: 'a@example.com', codeHash: 'h', keyId: 'k', expiresAt: NOW - 1, createdAt: NOW - 10, attemptsResetAt: NOW - 1 });
+    await s.putEmailCode({ email: 'b@example.com', codeHash: 'h', keyId: 'k', expiresAt: NOW + 1000, createdAt: NOW, attemptsResetAt: NOW + 1000 });
     await s.hitRateLimit('old', 1000, NOW - 2 * 86_400_000);
     await s.hitRateLimit('new', 1000, NOW);
     expect(await s.cleanup(NOW)).toBe(2);

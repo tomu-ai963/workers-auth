@@ -302,10 +302,12 @@ function sleep(ms: number): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * Six digits standing alone — not part of a longer number, and not a CSS hex
+ * N digits standing alone — not part of a longer number, and not a CSS hex
  * colour (`#123456`), which is the usual false positive in an HTML email.
  */
-const EMAIL_CODE_PATTERN = /(?<![\d#])\d{6}(?!\d)/g;
+function emailCodePattern(digits: number): RegExp {
+  return new RegExp(`(?<![\\d#])\\d{${digits}}(?!\\d)`, 'g');
+}
 
 /**
  * Pulls the 6-digit code out of a delivered `deviceAuth` email body (HTML or
@@ -318,7 +320,10 @@ const EMAIL_CODE_PATTERN = /(?<![\d#])\d{6}(?!\d)/g;
  * would be worse than one that fails. Pass `options.pattern` (capture group 1
  * if it has one) to point at the code exactly.
  */
-export function extractEmailCodeFromEmail(body: string, options: { pattern?: RegExp } = {}): string {
+export function extractEmailCodeFromEmail(
+  body: string,
+  options: { pattern?: RegExp; digits?: 6 | 8 } = {},
+): string {
   if (options.pattern) {
     const pattern = options.pattern.global
       ? new RegExp(options.pattern.source, options.pattern.flags.replace(/g/g, ''))
@@ -335,13 +340,14 @@ export function extractEmailCodeFromEmail(body: string, options: { pattern?: Reg
   const text = body
     .replace(/<(style|script)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
     .replace(/<[^>]*>/g, ' ');
-  const found = new Set(Array.from(text.matchAll(EMAIL_CODE_PATTERN), (m) => m[0]));
+  const digits = options.digits ?? 6;
+  const found = new Set(Array.from(text.matchAll(emailCodePattern(digits)), (m) => m[0]));
   if (found.size === 0) {
-    throw new Error(`extractEmailCodeFromEmail: no 6-digit code found in body (length: ${body.length})`);
+    throw new Error(`extractEmailCodeFromEmail: no ${digits}-digit code found in body (length: ${body.length})`);
   }
   if (found.size > 1) {
     throw new Error(
-      `extractEmailCodeFromEmail: ${found.size} different 6-digit numbers in body; pass options.pattern to pick one`,
+      `extractEmailCodeFromEmail: ${found.size} different ${digits}-digit numbers in body; pass options.pattern to pick one`,
     );
   }
   return found.values().next().value as string;

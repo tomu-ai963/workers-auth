@@ -121,7 +121,10 @@ export type DeviceAuthEvent =
   | { type: 'pin.login.succeeded'; userId: string; deviceId: string }
   | { type: 'pin.login.failed'; reason: string; userId?: string; deviceId?: string; failedCount?: number }
   | { type: 'pin.locked'; userId: string; deviceId: string }
-  | { type: 'pin.unlocked'; userId: string };
+  | { type: 'pin.unlocked'; userId: string }
+  | { type: 'sessions.revoked_all'; userId: string; reason: string }
+  | { type: 'bot_check.failed'; action: string }
+  | { type: 'circuit_breaker.open'; scope: string };
 
 export type MiddlewareOptions = {
   /** Allow unauthenticated requests through instead of answering 401. */
@@ -282,8 +285,18 @@ export async function readCookieSession(
   const cookies = parseCookies(c.req.raw.headers.get('cookie'));
   const sid = cookies[config.cookie.sessionCookieName];
   const csrfCookie = cookies[config.cookie.csrfCookieName];
-  const session = sid ? await config.store.get(sid) : null;
+  const found = sid ? await config.store.get(sid) : null;
+  // A bearer session is only ever valid as `Authorization: Bearer` (see
+  // `sessionBearer()`); presented as a cookie it is refused, mirroring the
+  // bearer provider's refusal of cookie sessions.
+  const session = found && !isBearerSession(found) ? found : null;
   return { session, csrfCookie };
+}
+
+/** Whether a session was minted with `transport: 'bearer'`. */
+export function isBearerSession(session: Session | SessionInfo): boolean {
+  const auth = session.meta?.[AUTH_META_KEY];
+  return typeof auth === 'object' && auth !== null && (auth as { transport?: unknown }).transport === 'bearer';
 }
 
 export type ResolvedRequestAuth = {

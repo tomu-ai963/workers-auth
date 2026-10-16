@@ -12,14 +12,17 @@
 -- concurrent requests from slipping past a limit. KV cannot do that, so there
 -- is no KV variant of this store.
 
--- One live code per address; a resend overwrites it (and its attempt count).
+-- One live code per address; a resend overwrites the code. Attempts already
+-- used carry over until attempts_reset_at (the first code's issue time + its
+-- lifetime), so resending can neither refill the 5-try budget nor extend it.
 CREATE TABLE IF NOT EXISTS auth_email_codes (
-  email      TEXT    PRIMARY KEY,
-  code_hash  TEXT    NOT NULL,
-  key_id     TEXT    NOT NULL,
-  attempts   INTEGER NOT NULL DEFAULT 0,
-  expires_at INTEGER NOT NULL,
-  created_at INTEGER NOT NULL
+  email             TEXT    PRIMARY KEY,
+  code_hash         TEXT    NOT NULL,
+  key_id            TEXT    NOT NULL,
+  attempts          INTEGER NOT NULL DEFAULT 0,
+  attempts_reset_at INTEGER NOT NULL,
+  expires_at        INTEGER NOT NULL,
+  created_at        INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_auth_email_codes_expires_at
