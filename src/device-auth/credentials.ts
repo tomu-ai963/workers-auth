@@ -69,7 +69,8 @@ export function isPinFormat(pin: unknown): pin is string {
  * `Passwords/Common-Credentials/10k-most-common.txt`, in their published
  * (frequency) order, plus a few well-known picks it does not contain.
  *
- * Source: https://github.com/danielmiessler/SecLists (MIT), fetched 2026-10-16,
+ * Source: https://github.com/danielmiessler/SecLists (MIT; notice in
+ * THIRD_PARTY_NOTICES), fetched 2026-10-16,
  * file sha256 68782d6a4a19a4768d5f15dd66bd534e7a33055cc755411e33f16d18c50fdcce.
  * These are passwords rather than PINs, but numeric passwords and PINs are
  * chosen the same way; many of them are also caught by the structural rules

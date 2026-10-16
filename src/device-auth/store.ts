@@ -64,6 +64,8 @@ export type CredentialRecord = {
   lastUsedAt: number | null;
 };
 
+export type CircuitBreakerState = { attempts: number; failures: number; windowStart: number };
+
 export type GuardState = {
   failedCount: number;
   lockedAt: number | null;
@@ -82,6 +84,15 @@ export interface DeviceAuthStore {
   readRateLimit(bucket: string, windowMs: number, now: number): Promise<{ count: number; windowStart: number }>;
   /** Gives back one hit taken by `hitRateLimit`, if that window is still the current one. */
   refundRateLimit(bucket: string, windowStart: number): Promise<void>;
+
+  /**
+   * Circuit breaker: counts one checked verification — and, if `failed`, one
+   * failure — in a single row and a single fixed window, so the two counts
+   * can never drift into different windows. Returns the counts including it.
+   */
+  hitCircuitBreaker(bucket: string, windowMs: number, now: number, failed: boolean): Promise<CircuitBreakerState>;
+  /** The current window's counts without adding to them (zeros when the window has lapsed). */
+  readCircuitBreaker(bucket: string, windowMs: number, now: number): Promise<CircuitBreakerState>;
 
   /**
    * Replaces the address's code. Attempts already used carry over while the
@@ -227,6 +238,34 @@ export function d1DeviceAuthStore(
         .prepare(`UPDATE ${limits} SET count = count - 1 WHERE bucket = ?1 AND window_start = ?2 AND count > 0`)
         .bind(bucket, windowStart)
         .run();
+    },
+
+    async hitCircuitBreaker(bucket, windowMs, now, failed) {
+      const failure = failed ? 1 : 0;
+      const row = await db
+        .prepare(
+          `INSERT INTO ${limits} (bucket, window_start, count, failures) VALUES (?1, ?2, 1, ?4)
+           ON CONFLICT(bucket) DO UPDATE SET
+             count        = CASE WHEN window_start <= ?3 THEN 1  ELSE count + 1        END,
+             failures     = CASE WHEN window_start <= ?3 THEN ?4 ELSE failures + ?4    END,
+             window_start = CASE WHEN window_start <= ?3 THEN ?2 ELSE window_start     END
+           RETURNING count, failures, window_start`,
+        )
+        .bind(bucket, now, now - windowMs, failure)
+        .first<{ count: number; failures: number; window_start: number }>();
+      return {
+        attempts: row?.count ?? 1,
+        failures: row?.failures ?? failure,
+        windowStart: row?.window_start ?? now,
+      };
+    },
+
+    async readCircuitBreaker(bucket, windowMs, now) {
+      const row = await db
+        .prepare(`SELECT count, failures, window_start FROM ${limits} WHERE bucket = ?1 AND window_start > ?2`)
+        .bind(bucket, now - windowMs)
+        .first<{ count: number; failures: number; window_start: number }>();
+      return { attempts: row?.count ?? 0, failures: row?.failures ?? 0, windowStart: row?.window_start ?? now };
     },
 
     async putEmailCode(record) {

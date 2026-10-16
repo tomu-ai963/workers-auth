@@ -411,9 +411,9 @@ trusted device: POST /pin/login {pin}           -> session
 
 Apply `migrations/0006_device_auth.sql`. The store is D1 only:
 `deviceAuth()` refuses a store that does not declare `atomic: true`, because
-every limit here (5 tries per code, 10 failures per address per day, 3 PIN
-failures, resend cooldowns) must hold under concurrent requests and KV cannot
-do that.
+every limit here (5 tries per code, 10 failures per address or per trusted
+device per day window, 3 PIN failures, resend cooldowns) must hold under
+concurrent requests and KV cannot do that.
 
 ### Three things `deviceAuth()` checks at construction
 
@@ -426,6 +426,15 @@ It throws, rather than letting a gap surface during an incident, unless:
    device is revoked, expired, or no longer the account's. That is what makes
    revoking a device end the sessions on it, for cookie and bearer sessions
    alike. Use the same D1 database for both stores.
+
+   Only the exact object `deviceBoundSessionStore()` returns counts — it is
+   recorded in a registry, so an `Object.create()` of it or an app wrapper
+   around it is *not* device-bound, and `deviceAuth()` refuses it. The cookie
+   middleware and `sessionBearer()` also refuse any session minted on a
+   trusted device that they read through a store other than that object (a
+   second `createAuth()` over the same table, say). If you wrap the store
+   yourself (logging, metrics), put your wrapper **inside**:
+   `deviceBoundSessionStore(myWrapper(d1SessionStore(env.DB)), devices)`.
 2. **The session store can `revokeAllForUser()`** (`canRevokeAllForUser`):
    `d1SessionStore`, or `kvSessionStore` with a `revocationList`.
    "Revoke all devices" and `revokeOtherDevicesOnChange` end every session of
@@ -577,27 +586,52 @@ unescaped label in a "your devices" page is a stored XSS.
 | `pin.revokeOtherDevicesOnChange` | `false` | on replacing an existing PIN: revoke the other devices **and every session of the account**, including the caller's (`signedOut: true`; the current device stays trusted, so it logs in again with the new PIN) |
 | `emailCode.ttlSec` / `.maxAttempts` | 600 / 5 | a resend inside the first code's lifetime keeps the attempts already used |
 | `emailCode.digits` | 6 | 6 or 8 |
-| `emailCode.maxFailuresPerEmail` / `.failureWindowSec` | 10 / 86,400 | failures per address across all its codes — see the trade-off below |
+| `emailCode.maxFailuresPerEmail` / `.failureWindowSec` | 10 / 86,400 | failures per address across all its codes, per fixed window — see the trade-off below |
+| `emailCode.maxFailuresPerDevice` | 10 | the separate budget for requests that present a trusted device of the address — see below |
 | `normalizeEmail` | trim + lower-case | the address everything is keyed on |
 | `freshEmailAuthSec` | 600 | how recent an email code `POST /pin` needs |
 | `bearerSessionTtlSec` | 43,200 (12 h) | `'response'` only |
-| `limits.resendCooldownSec` | 60 | per address |
-| `limits.codesPerEmailPerHour` | 5 | |
+| `limits.resendCooldownSec` | 60 | per address (per device, for a request presenting one of the address's devices) |
+| `limits.codesPerEmailPerHour` | 5 | same split as the cooldown |
 | `limits.startsPerIpPerHour` / `verifiesPerIpPerHour` / `pinLoginsPerIpPerHour` | 20 / 60 / 60 | per IPv4 address, per IPv6 **/64** |
 | `getClientIp` | `CF-Connecting-IP` | see below |
 | `requireClientIp` | `false` | `true` refuses requests with no client IP instead of skipping per-IP limits |
-| `botCheck` | — | `(req, 'email_start' \| 'pin_login') => boolean`; false or a throw → `403 bot_check_failed` |
+| `botCheck` | — | `(req, 'email_start' \| 'email_verify' \| 'pin_login') => boolean`; false or a throw → `403 bot_check_failed` |
 | `circuitBreaker` | off | `{ minFailures, maxFailureRatio = 0.5, windowSec = 600 }` — see below |
 
-**The per-address failure cap, and its trade-off.** Ten failed verifications
-for one address within 24 hours (across however many codes) stop *new-device
-login by email for that address for the rest of the 24 hours*: both
-`/email/start` and `/email/verify` answer `429`. Anyone who knows the address
-can trigger this. **PIN login on the user's trusted devices is not affected**,
-so an existing user on their own phone does not notice; a user trying to add a
-new device has to wait. That is the price of capping how many guesses an
-attacker gets against one address: without it, resending kept refilling the
-budget. Successful verifications do not count.
+**The per-address failure cap, and its trade-off.** Each address gets 10
+failed verifications (across however many codes) per fixed 24-hour window.
+The window is fixed, not sliding: 10 per window, so up to 20 within 24 hours
+when they straddle a window boundary. Only a check against a live code
+counts — successful verifications, and verifies with no code to try (none
+sent, expired, or its 5 attempts already used), cost nothing. To spend the
+budget an attacker therefore has to request codes (which go to the owner's
+inbox) and guess against them.
+
+Once the budget is spent, `/email/start` and `/email/verify` answer `429` for
+that address until the window ends — to every request that does not present
+a trusted device of the address. Anyone who knows the address can do this.
+What it stops, for that long, for anyone not on a live trusted device of the
+address:
+
+- logging in on a new device (or any device not trusted for this address);
+- unlocking a PIN locked by 3 wrong attempts;
+- setting or changing the PIN (`POST /pin` needs a fresh email verification);
+- your own routes behind `requireFreshEmailAuth()`;
+- logging in at all for a user with no PIN, or whose trusted device has
+  expired or been revoked (email is their only way in).
+
+**PIN login on a trusted device is not affected.** And **a user who holds a
+trusted device of the address can still recover**: a request that presents a
+valid (unrevoked, unexpired) device registered to that address is counted
+against that device's own budget — `emailCode.maxFailuresPerDevice` failures
+per window, plus its own resend cooldown and hourly send cap — and never
+against the address's. Someone without the device cannot spend that budget;
+someone who took the device gets that many tries and no more. So the owner
+of a locked PIN asks for a code *from their trusted device*, verifies it
+there, and the PIN is unlocked. A user with no live trusted device has to wait
+out the window. That is the price of capping how many guesses an attacker gets
+against one address: without it, resending kept refilling the budget.
 
 **Normalising addresses.** Everything is keyed on `normalizeEmail(input)`.
 If your accounts treat `a.b+tag@gmail.com` and `ab@gmail.com` as one user, do
@@ -618,16 +652,34 @@ every request may carry the proxy's address and all users share one bucket.
 Then pass a `getClientIp` that reads the header *your proxy sets* — never one a
 client can send — and consider `requireClientIp: true`.
 
-**`botCheck`** runs on `/email/start` before anything is sent or counted, and
-on `/pin/login` before any device or PIN work. Read your Turnstile token from
-the request (a clone) it is given.
+**`botCheck`** runs on `/email/start` before anything is sent or counted, on
+`/email/verify` before any budget, attempt or breaker count is taken, and on
+`/pin/login` before any device or PIN work. The second argument says which;
+return `true` for an action you do not want to guard. A Turnstile token is
+single-use, so guarding both email steps means the page fetches a fresh token
+for each. Read the token from the request (a clone) it is given.
 
-**`circuitBreaker`** (off by default): while, within `windowSec`, at least
-`minFailures` email verifications failed and they are at least
-`maxFailureRatio` of all verifications, `/email/verify` answers `503
-temporarily_unavailable` *to everyone*. It slows a distributed guessing run,
-and it also hands whoever can produce that many failures a switch that turns
-email login off — set `minFailures` far above your normal failure volume.
+**`circuitBreaker`** (off by default): while, within one fixed `windowSec`
+window, at least `minFailures` email verifications failed and they are at
+least `maxFailureRatio` of all verifications, `/email/verify` answers `503
+temporarily_unavailable` *to everyone*. Both numbers count only verifications
+that compared a live code, and both live in one row, counted in the same
+window. It slows a distributed guessing run, and it also hands whoever can
+produce that many failures a switch that turns email login off — set
+`minFailures` far above your normal failure volume.
+
+How many IPs that switch takes: each IPv4 address (IPv6: each /64) gets at
+most `verifiesPerIpPerHour` verifications per fixed hour, so within a breaker
+window of up to an hour it can add at most `2 × verifiesPerIpPerHour`
+failures (two hour-windows straddled). Each failure also needs a live code
+with attempts left, and `startsPerIpPerHour × 5` (100 by default) is no
+tighter. Opening the breaker therefore takes at least
+`⌈minFailures / (2 × verifiesPerIpPerHour)⌉` IPs — with the defaults
+`⌈minFailures / 120⌉`: 1 IP for `minFailures` ≤ 120, 5 for 600, 9 for
+1,000; `⌈minFailures / 60⌉` (10, 17) when nothing straddles an hour. A window
+longer than an hour lets each IP add more (`verifiesPerIpPerHour` per started
+hour plus one). If client IPs are missing and `requireClientIp` is off, the
+per-IP limits are skipped and one client can open it.
 
 Rejected as weak PINs: fewer than 3 distinct digits (`000000`, `101010`,
 `100000`), runs including ones that wrap round 9→0 (`123456`, `987654`,
@@ -635,7 +687,8 @@ Rejected as weak PINs: fewer than 3 distinct digits (`000000`, `101010`,
 `123123`), doubled/tripled digits (`112233`, `111222`), two straight keypad
 lines (`147258`, `159357`, `123654`), and the 179 six-digit numbers in
 SecLists' `10k-most-common.txt` (embedded in the source with its sha256) plus a
-few more. Dates are refused only with `pin.rejectDateLike`.
+few more. SecLists is MIT-licensed; its notice ships in
+[`THIRD_PARTY_NOTICES`](./THIRD_PARTY_NOTICES). Dates are refused only with `pin.rejectDateLike`.
 
 ### PIN cost: the pepper is what protects a 6-digit PIN
 

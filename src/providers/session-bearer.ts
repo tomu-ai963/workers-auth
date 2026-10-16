@@ -16,7 +16,7 @@
  *     cookie session id, if it ever leaked, cannot be replayed as a bearer.
  */
 
-import { isBearerSession, sessionToUser } from '../middleware.js';
+import { deviceCheckApplied, isBearerSession, sessionToUser } from '../middleware.js';
 import type { AuthProvider, AuthUser, Session, SessionStore } from '../types.js';
 
 export const BEARER_SESSION_PREFIX = 'wsb_';
@@ -39,12 +39,16 @@ export function readBearerSessionId(req: Request): string | null {
   return /^[A-Za-z0-9_-]{20,}$/.test(sid) ? sid : null;
 }
 
-/** The live bearer session this request presents, or null. */
+/**
+ * The live bearer session this request presents, or null. A session minted on
+ * a trusted device is refused unless `store` is the `deviceBoundSessionStore()`
+ * itself, since only that store checks the device.
+ */
 export async function readBearerSession(store: SessionStore, req: Request): Promise<Session | null> {
   const sid = readBearerSessionId(req);
   if (!sid) return null;
   const session = await store.get(sid);
-  return session && isBearerSession(session) ? session : null;
+  return session && isBearerSession(session) && deviceCheckApplied(store, session) ? session : null;
 }
 
 /** Revokes the presented bearer session. Resolves false when there was none. */

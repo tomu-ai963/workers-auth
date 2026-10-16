@@ -85,11 +85,15 @@ CREATE TABLE IF NOT EXISTS auth_login_guards (
   updated_at   INTEGER NOT NULL
 );
 
--- Fixed-window counters for resend cooldowns and per-email / per-IP limits.
+-- Fixed-window counters for resend cooldowns and per-email / per-device /
+-- per-IP limits. The /email/verify circuit breaker keeps its two counters in
+-- one row — count = checked verifications, failures = the failed ones — so
+-- both are always counted in the same window. Other buckets leave failures 0.
 CREATE TABLE IF NOT EXISTS auth_rate_limits (
   bucket       TEXT    PRIMARY KEY,
   window_start INTEGER NOT NULL,
-  count        INTEGER NOT NULL
+  count        INTEGER NOT NULL,
+  failures     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_auth_rate_limits_window_start

@@ -24,6 +24,7 @@ import {
   AUTH_META_KEY,
   clearSessionCookies,
   readCookieSession,
+  sessionBoundDeviceId,
   sessionToUser,
   toSessionInfo,
   type AuthEvent,
@@ -73,6 +74,7 @@ export {
   type DeviceInfo,
   type DeviceRecord,
   type EmailCodeRecord,
+  type CircuitBreakerState,
   type GuardState,
   type ReservedEmailCode,
 } from './store.js';
@@ -99,6 +101,8 @@ export type DeviceAuthLimits = {
   /** `/pin/login` calls per IP (IPv6: per /64) per hour. Default: 60. */
   pinLoginsPerIpPerHour?: number;
 };
+
+export type BotCheckAction = 'email_start' | 'email_verify' | 'pin_login';
 
 export type DeviceAuthOptions = {
   /**
@@ -194,12 +198,29 @@ export type DeviceAuthOptions = {
     digits?: 6 | 8;
     /**
      * Failed verifications allowed per address across all of its codes, per
-     * `failureWindowSec`. Once reached, `/email/start` and `/email/verify`
-     * for that address answer 429 until the window passes: new-device login
-     * by email is blocked for that long, PIN login on trusted devices is not
-     * affected. Default: 10.
+     * `failureWindowSec` window (fixed, so up to twice this across a window
+     * boundary). Only checks against a live code count: a verify with no code
+     * to try, or one whose attempts are used up, costs nothing.
+     *
+     * Once reached, `/email/start` and `/email/verify` answer 429 for that
+     * address — to every request that does not present a trusted device of
+     * the address (those use `maxFailuresPerDevice` instead). Until the window
+     * passes, that stops: logging in on a new device; unlocking a locked PIN;
+     * setting or changing the PIN; routes behind `requireFreshEmailAuth`; and
+     * login for anyone with no PIN or whose device has expired. PIN login on a
+     * trusted device is not affected. Default: 10.
      */
     maxFailuresPerEmail?: number;
+    /**
+     * The separate budget for requests presenting a valid trusted device
+     * registered to the address (unrevoked, unexpired): failed verifications
+     * per device per `failureWindowSec`. Someone without the device cannot
+     * spend it, so its owner can still get a code — and unlock a PIN — while
+     * the address budget is exhausted; someone who took the device gets this
+     * many tries and no more. The same device also gets its own resend
+     * cooldown and hourly send cap at `/email/start`. Default: 10.
+     */
+    maxFailuresPerDevice?: number;
     /** Default: 86,400 (24 hours). */
     failureWindowSec?: number;
   };
@@ -226,20 +247,24 @@ export type DeviceAuthOptions = {
    */
   requireClientIp?: boolean;
   /**
-   * Bot-defence hook (Turnstile, etc.), run before `/email/start` sends and
-   * before `/pin/login` does anything costly. Return false — or throw — to
-   * refuse with `403 bot_check_failed`. `req` is a fresh clone; read your
-   * token from its headers or body.
+   * Bot-defence hook (Turnstile, etc.), run before `/email/start` sends,
+   * before `/email/verify` checks a code, and before `/pin/login` does
+   * anything costly. Return false — or throw — to refuse with `403
+   * bot_check_failed`. Return true for an `action` you do not want to guard
+   * (a Turnstile token is single-use, so guarding both email steps needs a
+   * fresh token for each). `req` is a fresh clone; read your token from its
+   * headers or body.
    */
-  botCheck?: (req: Request, action: 'email_start' | 'pin_login') => boolean | Promise<boolean>;
+  botCheck?: (req: Request, action: BotCheckAction) => boolean | Promise<boolean>;
   /**
    * Off by default. When set, `/email/verify` answers `503
-   * temporarily_unavailable` to everyone while, within `windowSec`, at least
-   * `minFailures` verifications failed and they make up at least
-   * `maxFailureRatio` of all verifications — a brake on a distributed
-   * guessing run. The trade: whoever can cause that many failures can use it
-   * to stop email login for everybody, so set `minFailures` well above your
-   * normal traffic.
+   * temporarily_unavailable` to everyone while, within one `windowSec`
+   * window, at least `minFailures` checked verifications failed and they make
+   * up at least `maxFailureRatio` of all checked verifications — a brake on a
+   * distributed guessing run. Only verifications that compared a live code
+   * count, in both numbers. The trade: whoever can cause that many failures
+   * can use it to stop email login for everybody, so set `minFailures` well
+   * above your normal traffic (README: how many IPs that takes).
    */
   circuitBreaker?: {
     minFailures: number;
@@ -352,11 +377,6 @@ function emailVerifiedAt(session: Session): number | null {
   return typeof auth?.emailVerifiedAt === 'number' ? auth.emailVerifiedAt : null;
 }
 
-function sessionDeviceId(session: Session): string | null {
-  const auth = session.meta?.[AUTH_META_KEY] as { deviceId?: unknown } | undefined;
-  return typeof auth?.deviceId === 'string' ? auth.deviceId : null;
-}
-
 function publicDevice(device: DeviceRecord) {
   return {
     deviceId: device.deviceId,
@@ -434,6 +454,12 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
   }
   const codeRe = new RegExp(`^\\d{${codeDigits}}$`);
   const maxFailuresPerEmail = positive(options.emailCode?.maxFailuresPerEmail, 10, 'emailCode.maxFailuresPerEmail', true);
+  const maxFailuresPerDevice = positive(
+    options.emailCode?.maxFailuresPerDevice,
+    10,
+    'emailCode.maxFailuresPerDevice',
+    true,
+  );
   const failureWindowSec = positive(options.emailCode?.failureWindowSec, DAY_SEC, 'emailCode.failureWindowSec');
   const freshMs = positive(options.freshEmailAuthSec, 600, 'freshEmailAuthSec') * SEC;
   const bearerTtlSec = positive(options.bearerSessionTtlSec, 12 * HOUR_SEC, 'bearerSessionTtlSec');
@@ -571,7 +597,7 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
     return rateLimited(c, `${action}:ip:${ipRateLimitKey(ip)}`, HOUR_SEC, limit, scope, now);
   }
 
-  async function botRefused(c: Context, action: 'email_start' | 'pin_login'): Promise<Response | null> {
+  async function botRefused(c: Context, action: BotCheckAction): Promise<Response | null> {
     if (!botCheck) return null;
     let passed = false;
     try {
@@ -700,9 +726,32 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
     return typeof email === 'string' && looksLikeEmail(email) ? email : null;
   }
 
-  const failureBucket = (emailKey: string) => `otp-fail:${emailKey}`;
-  const CB_ATTEMPTS = 'cb:email-verify:attempts';
-  const CB_FAILURES = 'cb:email-verify:failures';
+  /**
+   * A trusted device presented with this request that was registered to this
+   * very address and is still live — the condition for using the device's own
+   * budgets instead of the address's. Decided before any code is checked, so
+   * it rests on the device record alone (`resolveUser` is not called early).
+   */
+  async function deviceOfAddress(c: Context, email: string, now: number): Promise<DeviceRecord | null> {
+    const device = await readDevice(c, now);
+    return device && device.email === email ? device : null;
+  }
+
+  type Budget = { failures: string; maxFailures: number; send: string; scope: 'email' | 'device' };
+
+  /** Address budgets for anyone; a device's own budgets for a request that holds one of the address's devices. */
+  function budgetFor(emailKey: string, device: DeviceRecord | null): Budget {
+    return device
+      ? {
+          failures: `otp-fail:device:${device.deviceId}`,
+          maxFailures: maxFailuresPerDevice,
+          send: `device:${device.deviceId}`,
+          scope: 'device',
+        }
+      : { failures: `otp-fail:${emailKey}`, maxFailures: maxFailuresPerEmail, send: emailKey, scope: 'email' };
+  }
+
+  const CB_BUCKET = 'cb:email-verify';
 
   // -------------------------------------------------------------------------
   // Routes
@@ -735,20 +784,39 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
       const ipHit = await ipLimited(c, 'otp-start', limits.startsPerIp, 'email_start_ip', now);
       if (ipHit) return ipHit;
       const emailKey = await sha256Hex(email);
+      // Holding one of the address's trusted devices moves this request off
+      // every per-address budget onto the device's own, so exhausting the
+      // address's budgets — which needs nothing but the address — cannot keep
+      // the device's owner from getting a code.
+      const budget = budgetFor(emailKey, await deviceOfAddress(c, email, now));
 
-      // A code the address could not verify anyway is not worth sending.
-      const failures = await store.readRateLimit(failureBucket(emailKey), failureWindowSec * SEC, now);
-      if (failures.count >= maxFailuresPerEmail) {
-        onEvent({ type: 'rate_limited', scope: 'email_failures' });
+      // A code the requester could not verify anyway is not worth sending.
+      const failures = await store.readRateLimit(budget.failures, failureWindowSec * SEC, now);
+      if (failures.count >= budget.maxFailures) {
+        onEvent({ type: 'rate_limited', scope: `${budget.scope}_failures` });
         return c.json(
           { error: 'rate_limited' as const, retryAfterSec: retryAfter(c, failures.windowStart, failureWindowSec, now) },
           429,
         );
       }
 
-      const cooled = await rateLimited(c, `otp-cool:${emailKey}`, limits.cooldownSec, 1, 'email_cooldown', now);
+      const cooled = await rateLimited(
+        c,
+        `otp-cool:${budget.send}`,
+        limits.cooldownSec,
+        1,
+        `${budget.scope}_cooldown`,
+        now,
+      );
       if (cooled) return cooled;
-      const capped = await rateLimited(c, `otp-email:${emailKey}`, HOUR_SEC, limits.perEmail, 'email_hourly', now);
+      const capped = await rateLimited(
+        c,
+        `otp-email:${budget.send}`,
+        HOUR_SEC,
+        limits.perEmail,
+        `${budget.scope}_hourly`,
+        now,
+      );
       if (capped) return capped;
 
       const ring = await keys();
@@ -784,52 +852,64 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
       const rawLabel = b.body?.['deviceLabel'];
       const label = typeof rawLabel === 'string' && rawLabel.length > 0 ? rawLabel.slice(0, 100) : null;
 
+      const bot = await botRefused(c, 'email_verify');
+      if (bot) return bot;
+
       const now = clock();
       const ipHit = await ipLimited(c, 'otp-verify', limits.verifiesPerIp, 'email_verify_ip', now);
       if (ipHit) return ipHit;
 
       if (breaker) {
-        const [attempts, failed] = await Promise.all([
-          store.readRateLimit(CB_ATTEMPTS, breaker.windowSec * SEC, now),
-          store.readRateLimit(CB_FAILURES, breaker.windowSec * SEC, now),
-        ]);
-        if (failed.count >= breaker.minFailures && failed.count >= breaker.ratio * Math.max(attempts.count, 1)) {
+        const cb = await store.readCircuitBreaker(CB_BUCKET, breaker.windowSec * SEC, now);
+        if (cb.failures >= breaker.minFailures && cb.failures >= breaker.ratio * Math.max(cb.attempts, 1)) {
           onEvent({ type: 'circuit_breaker.open', scope: 'email_verify' });
           return c.json(
             {
               error: 'temporarily_unavailable' as const,
-              retryAfterSec: retryAfter(c, failed.windowStart, breaker.windowSec, now),
+              retryAfterSec: retryAfter(c, cb.windowStart, breaker.windowSec, now),
             },
             503,
           );
         }
-        await store.hitRateLimit(CB_ATTEMPTS, breaker.windowSec * SEC, now);
       }
 
       const fp = await emailFingerprint(email);
       const emailKey = await sha256Hex(email);
+      const budget = budgetFor(emailKey, await deviceOfAddress(c, email, now));
 
-      // Reserve a failure against the address *before* checking anything, and
-      // give it back only on success. Ten concurrent guesses therefore use ten
-      // reservations; the 11th is refused without being checked.
-      const slot = await store.hitRateLimit(failureBucket(emailKey), failureWindowSec * SEC, now);
-      if (slot.count > maxFailuresPerEmail) {
-        onEvent({ type: 'rate_limited', scope: 'email_failures' });
+      // Reserve a failure against the budget *before* checking anything, and
+      // give it back on success — or when there turns out to be nothing to
+      // check. Ten concurrent guesses therefore use ten reservations; the 11th
+      // is refused without being checked.
+      const slot = await store.hitRateLimit(budget.failures, failureWindowSec * SEC, now);
+      if (slot.count > budget.maxFailures) {
+        onEvent({ type: 'rate_limited', scope: `${budget.scope}_failures` });
         return c.json(
           { error: 'rate_limited' as const, retryAfterSec: retryAfter(c, slot.windowStart, failureWindowSec, now) },
           429,
         );
       }
 
+      /** One checked verification for the breaker: attempt and outcome in the same row and window. */
+      const checked = async (failed: boolean) => {
+        if (breaker) await store.hitCircuitBreaker(CB_BUCKET, breaker.windowSec * SEC, now, failed);
+      };
       const invalid = async (reason: string) => {
         onEvent({ type: 'email_code.failed', emailFingerprint: fp, reason });
-        if (breaker) await store.hitRateLimit(CB_FAILURES, breaker.windowSec * SEC, now);
+        await checked(true);
         return c.json({ error: 'invalid_code' as const }, 401);
       };
 
       // Then reserve the attempt on this code: five concurrent guesses use five attempts.
       const reserved = await store.reserveEmailCodeAttempt(email, now, codeMaxAttempts);
-      if (!reserved) return invalid('no_live_code');
+      if (!reserved) {
+        // No code, an expired one, or one with its attempts used up: nothing
+        // was compared, so nothing was learned and nothing is charged —
+        // neither to the budget nor to the breaker. Same answer as a mismatch.
+        await store.refundRateLimit(budget.failures, slot.windowStart);
+        onEvent({ type: 'email_code.failed', emailFingerprint: fp, reason: 'no_live_code' });
+        return c.json({ error: 'invalid_code' as const }, 401);
+      }
       const derived = (await keys()).byId.get(reserved.keyId);
       const matches =
         derived !== undefined && timingSafeEqual(await hmacHex(derived.otpKey, `${email}\n${code}`), reserved.codeHash);
@@ -839,7 +919,8 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
 
       const resolved = await resolveUser(email);
       if (!checkUser(resolved)) return invalid('user_refused');
-      await store.refundRateLimit(failureBucket(emailKey), slot.windowStart);
+      await store.refundRateLimit(budget.failures, slot.windowStart);
+      await checked(false);
       const user: AuthUser = { ...resolved, claims: { ...resolved.claims, provider: 'email-code' } };
       onEvent({ type: 'email_code.verified', userId: user.id, emailFingerprint: fp });
 
@@ -914,7 +995,7 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
       onEvent({ type: 'pin.set', userId: session.userId, replaced });
 
       if (replaced && revokeOthersOnChange) {
-        const count = await store.revokeAllDevices(session.userId, now, sessionDeviceId(session));
+        const count = await store.revokeAllDevices(session.userId, now, sessionBoundDeviceId(session));
         if (count > 0) onEvent({ type: 'device.revoked', userId: session.userId, count, reason: 'pin_changed' });
         // Including this session: the device that is kept still logs in again
         // with the new PIN, and a session without a device (trustDevice: false)
@@ -1015,7 +1096,7 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
       if (!g.session) return c.json({ error: 'unauthenticated' as const }, 401);
       return c.json({
         devices: await store.listDevices(g.session.userId, clock()),
-        currentDeviceId: sessionDeviceId(g.session),
+        currentDeviceId: sessionBoundDeviceId(g.session),
       });
     });
 

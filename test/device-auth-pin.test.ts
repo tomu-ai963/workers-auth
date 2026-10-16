@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { sha256Hex } from '../src/crypto.js';
 import { resetStorage } from './helpers/reset.js';
 import {
+  HEAVY_TIMEOUT,
   call,
   client,
   DAY,
@@ -49,7 +50,7 @@ async function guard(accountId: string) {
     .first<{ failed_count: number; locked_at: number | null }>();
 }
 
-describe('trusted devices', () => {
+describe('trusted devices', { timeout: HEAVY_TIMEOUT }, () => {
   it('stores only sha256 of the device secret', async () => {
     const h = setup({ transport: 'response' });
     const c = client();
@@ -194,7 +195,7 @@ describe('trusted devices', () => {
   });
 });
 
-describe('PIN enrolment', () => {
+describe('PIN enrolment', { timeout: HEAVY_TIMEOUT }, () => {
   it.each(['000000', '777777', '123456', '234567', '987654', '012345', '121212', '123123', '112233', '111222', '147258'])(
     'rejects the weak PIN %s',
     async (weak) => {
@@ -299,7 +300,7 @@ describe('PIN enrolment', () => {
   });
 });
 
-describe('PIN login', () => {
+describe('PIN login', { timeout: HEAVY_TIMEOUT }, () => {
   it('logs in with device + PIN', async () => {
     const h = setup();
     const c = await enrolled(h, EMAIL);
@@ -356,7 +357,7 @@ describe('PIN login', () => {
   });
 });
 
-describe('failure counting and lockout', () => {
+describe('failure counting and lockout', { timeout: HEAVY_TIMEOUT }, () => {
   async function lockOut(h: Harness, c: ReturnType<typeof client>) {
     const r1 = await pinLogin(h, c, WRONG);
     const r2 = await pinLogin(h, c, WRONG);
@@ -467,7 +468,7 @@ describe('failure counting and lockout', () => {
   });
 });
 
-describe('requireFreshEmailAuth', () => {
+describe('requireFreshEmailAuth', { timeout: HEAVY_TIMEOUT }, () => {
   it('admits a session minted by an email code, within the window only', async () => {
     const h = setup();
     const c = client();

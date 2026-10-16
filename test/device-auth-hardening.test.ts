@@ -22,6 +22,7 @@ import { kvSessionStore } from '../src/store/kv.js';
 import { extractEmailCodeFromEmail } from '../src/testing.js';
 import { resetStorage } from './helpers/reset.js';
 import {
+  HEAVY_TIMEOUT,
   call,
   client,
   enrolled,
@@ -32,8 +33,10 @@ import {
   pinLogin,
   SEC,
   setup,
+  spendFailures,
   T0,
   time,
+  wrongCode,
 } from './helpers/device.js';
 
 beforeEach(async () => {
@@ -44,26 +47,27 @@ beforeEach(async () => {
 const PIN = '482915';
 const REQUIRED = { error: 'email_verification_required' };
 
-async function failVerify(h: ReturnType<typeof setup>, email: string, n: number) {
-  for (let i = 0; i < n; i++) {
-    await call(h, client(), 'POST', '/auth/device/email/verify', { email, code: '000000' });
-  }
+/** One checked wrong guess: a fresh code, then a wrong code against it. */
+async function startAndFail(h: ReturnType<typeof setup>, email: string) {
+  await call(h, client(), 'POST', '/auth/device/email/start', { email });
+  return call(h, client(), 'POST', '/auth/device/email/verify', { email, code: wrongCode(h, email) });
 }
 
 // ---------------------------------------------------------------------------
 // P0-1
 // ---------------------------------------------------------------------------
 
-describe('P0-1 (a): failures per address across codes', () => {
+describe('P0-1 (a): failures per address across codes', { timeout: HEAVY_TIMEOUT }, () => {
   it('blocks /email/start too once the cap is reached, and lifts after the window', async () => {
     const h = setup();
     const email = 'cap@example.com';
-    await failVerify(h, email, 10);
+    await spendFailures(h, client(), email, 10);
+    const sentBefore = h.sent.length;
     const start = await call(h, client(), 'POST', '/auth/device/email/start', { email });
     expect(start.status).toBe(429);
     expect(start.body).toMatchObject({ error: 'rate_limited' });
     expect(Number(start.res.headers.get('retry-after'))).toBeGreaterThan(23 * 3600);
-    expect(h.sent).toHaveLength(0);
+    expect(h.sent).toHaveLength(sentBefore);
     expect(h.events).toContainEqual({ type: 'rate_limited', scope: 'email_failures' });
 
     time.now += 24 * HOUR;
@@ -73,20 +77,24 @@ describe('P0-1 (a): failures per address across codes', () => {
   it('a success gives its own reservation back, and does not wipe earlier failures', async () => {
     const h = setup();
     const email = 'refund@example.com';
-    await failVerify(h, email, 9);
+    await spendFailures(h, client(), email, 9);
     // Successes do not count: two in a row after 9 failures both pass.
     expect((await loginByEmail(h, client(), email)).status).toBe(200);
     time.now += 61 * SEC;
     expect((await loginByEmail(h, client(), email)).status).toBe(200);
     // ...but the 9 failures are still there: one more reaches the cap.
-    await failVerify(h, email, 1);
-    expect((await call(h, client(), 'POST', '/auth/device/email/start', { email })).status).toBe(429);
+    time.now += 61 * SEC;
+    expect((await startAndFail(h, email)).status).toBe(401);
+    time.now += 61 * SEC; // past the cooldown, so only the failure cap can refuse
+    const start = await call(h, client(), 'POST', '/auth/device/email/start', { email });
+    expect(start.status).toBe(429);
+    expect(h.events.at(-1)).toEqual({ type: 'rate_limited', scope: 'email_failures' });
   });
 
   it('honours maxFailuresPerEmail / failureWindowSec', async () => {
     const h = setup({ emailCode: { maxFailuresPerEmail: 3, failureWindowSec: 3600 } });
     const email = 'small@example.com';
-    await failVerify(h, email, 3);
+    await spendFailures(h, client(), email, 3);
     expect((await call(h, client(), 'POST', '/auth/device/email/start', { email })).status).toBe(429);
     time.now += HOUR;
     expect((await call(h, client(), 'POST', '/auth/device/email/start', { email })).status).toBe(200);
@@ -96,29 +104,35 @@ describe('P0-1 (a): failures per address across codes', () => {
     const h = setup();
     const email = 'pin-ok@example.com';
     const c = await enrolled(h, email);
-    await failVerify(h, email, 12);
+    time.now += 61 * SEC;
+    await spendFailures(h, client(), email, 10);
     expect((await call(h, client(), 'POST', '/auth/device/email/verify', { email, code: '123456' })).status).toBe(429);
     expect((await pinLogin(h, c, PIN)).status).toBe(200);
   });
 
   it('counts concurrent failures exactly: 15 parallel guesses, at most 10 get checked', async () => {
-    const h = setup();
+    // 20 attempts per code, so the address budget (10) is what binds.
+    const h = setup({ emailCode: { maxAttempts: 20 } });
     const email = 'burst@example.com';
     await call(h, client(), 'POST', '/auth/device/email/start', { email });
+    const wrong = wrongCode(h, email);
     const results = await Promise.all(
-      Array.from({ length: 15 }, () => call(h, client(), 'POST', '/auth/device/email/verify', { email, code: '000000' })),
+      Array.from({ length: 15 }, () => call(h, client(), 'POST', '/auth/device/email/verify', { email, code: wrong })),
     );
     expect(results.filter((r) => r.status === 401)).toHaveLength(10);
     expect(results.filter((r) => r.status === 429)).toHaveLength(5);
+    expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(10);
   });
 });
 
-describe('P0-1 (b): a resend keeps used attempts while the window lasts', () => {
+describe('P0-1 (b): a resend keeps used attempts while the window lasts', { timeout: HEAVY_TIMEOUT }, () => {
   it('refills only after the first code’s lifetime has passed', async () => {
     const h = setup();
     const email = 'carry@example.com';
     await call(h, client(), 'POST', '/auth/device/email/start', { email });
-    await failVerify(h, email, 5);
+    for (let i = 0; i < 5; i++) {
+      await call(h, client(), 'POST', '/auth/device/email/verify', { email, code: wrongCode(h, email) });
+    }
     time.now += 9 * MIN; // still inside the first code's 10 minutes
     await call(h, client(), 'POST', '/auth/device/email/start', { email });
     expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
@@ -180,7 +194,7 @@ describe('P0-1 (c): 8-digit codes', () => {
 // P0-2
 // ---------------------------------------------------------------------------
 
-describe('P0-2: device-bound sessions', () => {
+describe('P0-2: device-bound sessions', { timeout: HEAVY_TIMEOUT }, () => {
   it('a revoked device’s bearer session dies at once, and its row is gone', async () => {
     const h = setup({ transport: 'response' });
     const owner = await enrolled(h, 'owner@example.com');
@@ -333,18 +347,18 @@ describe('P1 (a): IPv6 is limited per /64', () => {
   });
 });
 
-describe('P1 (b): circuit breaker', () => {
+describe('P1 (b): circuit breaker', { timeout: HEAVY_TIMEOUT }, () => {
   it('is off by default', async () => {
-    const h = setup({ emailCode: { maxFailuresPerEmail: 1000 } });
+    const h = setup();
     for (let i = 0; i < 30; i++) {
-      expect((await call(h, client(), 'POST', '/auth/device/email/verify', { email: `cb${i}@example.com`, code: '000000' })).status).toBe(401);
+      expect((await startAndFail(h, `cb${i}@example.com`)).status).toBe(401);
     }
   });
 
   it('opens on enough failures at a high enough ratio, for everyone, and closes after the window', async () => {
     const h = setup({ circuitBreaker: { minFailures: 5, maxFailureRatio: 0.5, windowSec: 300 } });
     for (let i = 0; i < 5; i++) {
-      await call(h, client(), 'POST', '/auth/device/email/verify', { email: `x${i}@example.com`, code: '000000' });
+      expect((await startAndFail(h, `x${i}@example.com`)).status).toBe(401);
     }
     await call(h, client(), 'POST', '/auth/device/email/start', { email: 'victim@example.com' });
     const res = await call(h, client(), 'POST', '/auth/device/email/verify', { email: 'victim@example.com', code: h.lastCode('victim@example.com') });
@@ -363,13 +377,13 @@ describe('P1 (b): circuit breaker', () => {
       expect((await loginByEmail(h, client(), `ok${i}@example.com`)).status).toBe(200);
     }
     for (let i = 0; i < 2; i++) {
-      await call(h, client(), 'POST', '/auth/device/email/verify', { email: `bad${i}@example.com`, code: '000000' });
+      expect((await startAndFail(h, `bad${i}@example.com`)).status).toBe(401);
     }
     expect((await loginByEmail(h, client(), 'next@example.com')).status).toBe(200);
   });
 });
 
-describe('P1 (c): bot check hook', () => {
+describe('P1 (c): bot check hook', { timeout: HEAVY_TIMEOUT }, () => {
   it('refuses /email/start before sending and before counting, when the hook says no', async () => {
     const seen: string[] = [];
     const h = setup({
@@ -405,7 +419,7 @@ describe('P1 (c): bot check hook', () => {
     const res = await pinLogin(h, c, PIN);
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: 'bot_check_failed' });
-    expect(calls).toBe(2);
+    expect(calls).toBe(3); // email_start + email_verify while enrolling, then pin_login
     expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_login_guards').first('n')).toBe(0);
   });
 });

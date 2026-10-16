@@ -5,14 +5,14 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { resetStorage } from './helpers/reset.js';
-import { call, client, enrolled, loginByEmail, pinLogin, SEC, setup, T0, time } from './helpers/device.js';
+import { HEAVY_TIMEOUT, call, client, enrolled, loginByEmail, MIN, pinLogin, SEC, setup, T0, time } from './helpers/device.js';
 
 beforeEach(async () => {
   time.now = T0;
   await resetStorage();
 });
 
-describe('P0-1: email codes cannot be brute-forced across resends', () => {
+describe('P0-1: email codes cannot be brute-forced across resends', { timeout: HEAVY_TIMEOUT }, () => {
   it('10 wrong guesses spread over two codes block the next correct code', async () => {
     const h = setup();
     const email = 'v@example.com';
@@ -28,7 +28,28 @@ describe('P0-1: email codes cannot be brute-forced across resends', () => {
     }
     expect(statuses).toEqual(Array(10).fill(401));
 
+    // The resend inherited the 5 used attempts, so the second round was never
+    // checked (and, since the re-review, never charged). The correct code of a
+    // third resend is still refused.
     await call(h, client(), 'POST', '/auth/device/email/start', { email });
+    const res = await call(h, client(), 'POST', '/auth/device/email/verify', { email, code: h.lastCode(email) });
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: 'invalid_code' });
+  });
+
+  it('10 checked wrong guesses over two attempt windows block the next correct code', async () => {
+    const h = setup();
+    const email = 'v2@example.com';
+    for (let round = 0; round < 2; round++) {
+      await call(h, client(), 'POST', '/auth/device/email/start', { email });
+      const code = h.lastCode(email);
+      for (let i = 0; i < 5; i++) {
+        const wrong = String((Number(code) + 1 + i) % 1_000_000).padStart(6, '0');
+        expect((await call(h, client(), 'POST', '/auth/device/email/verify', { email, code: wrong })).status).toBe(401);
+      }
+      time.now += 11 * MIN; // past the attempt window: the next code has 5 fresh attempts
+    }
+    expect((await call(h, client(), 'POST', '/auth/device/email/start', { email })).status).toBe(429);
     const res = await call(h, client(), 'POST', '/auth/device/email/verify', { email, code: h.lastCode(email) });
     expect(res.status).toBe(429);
     expect(res.body).toMatchObject({ error: 'rate_limited' });
@@ -51,7 +72,7 @@ describe('P0-1: email codes cannot be brute-forced across resends', () => {
   });
 });
 
-describe('P0-2: revoking a device ends the sessions minted on it', () => {
+describe('P0-2: revoking a device ends the sessions minted on it', { timeout: HEAVY_TIMEOUT }, () => {
   it('a thief’s cookie session dies on /devices/:id/revoke and stays dead after revoke-all', async () => {
     const h = setup();
     const owner = await enrolled(h, 'a@example.com');

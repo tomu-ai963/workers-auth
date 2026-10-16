@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { generateEmailCode } from '../src/device-auth/index.js';
 import { resetStorage } from './helpers/reset.js';
-import { call, client, loginByEmail, MIN, SEC, setup, T0, time } from './helpers/device.js';
+import { HEAVY_TIMEOUT, call, client, loginByEmail, MIN, SEC, setup, T0, time } from './helpers/device.js';
 
 beforeEach(async () => {
   time.now = T0;
@@ -34,7 +34,7 @@ describe('email code generation', () => {
   });
 });
 
-describe('POST /email/start', () => {
+describe('POST /email/start', { timeout: HEAVY_TIMEOUT }, () => {
   it('stores only an HMAC of the code', async () => {
     const h = setup();
     await call(h, client(), 'POST', '/auth/device/email/start', { email: EMAIL });
@@ -114,7 +114,7 @@ describe('POST /email/start', () => {
   });
 });
 
-describe('POST /email/verify', () => {
+describe('POST /email/verify', { timeout: HEAVY_TIMEOUT }, () => {
   it('accepts the delivered code once and mints a session', async () => {
     const h = setup();
     const c = client();
@@ -152,7 +152,7 @@ describe('POST /email/verify', () => {
     expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
   });
 
-  it('counts concurrent wrong guesses: 10 in parallel exhaust the code and the address budget', async () => {
+  it('counts concurrent wrong guesses: 10 in parallel exhaust the code, and only checked ones cost budget', async () => {
     const h = setup();
     await call(h, client(), 'POST', '/auth/device/email/start', { email: EMAIL });
     const code = h.lastCode(EMAIL);
@@ -162,10 +162,13 @@ describe('POST /email/verify', () => {
     );
     expect(results.every((r) => r.status === 401)).toBe(true);
     expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
-    // All 10 reserved a failure against the address, so the 11th is refused unchecked.
+    // Five were checked and failed; the other five found no attempt left and
+    // gave their reservation back. The correct code is still refused: the
+    // code's attempts are spent.
+    expect(await env.DB.prepare("SELECT count FROM auth_rate_limits WHERE bucket LIKE 'otp-fail:%'").first('count')).toBe(5);
     const res = await call(h, client(), 'POST', '/auth/device/email/verify', { email: EMAIL, code });
-    expect(res.status).toBe(429);
-    expect(res.body).toMatchObject({ error: 'rate_limited' });
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: 'invalid_code' });
   });
 
   it('lets exactly one of two concurrent correct submissions through', async () => {

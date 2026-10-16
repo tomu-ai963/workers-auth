@@ -6,6 +6,7 @@ import type { Context, MiddlewareHandler, Next } from 'hono';
 
 import { parseCookies, serializeCookie, serializeCookieDeletion, type ResolvedCookieConfig } from './cookie.js';
 import { issueCsrfToken, verifyCsrf } from './csrf.js';
+import { isRegisteredDeviceBoundStore } from './device-bound.js';
 import { applyNoStore } from './headers.js';
 import type {
   AuthUser,
@@ -289,8 +290,24 @@ export async function readCookieSession(
   // A bearer session is only ever valid as `Authorization: Bearer` (see
   // `sessionBearer()`); presented as a cookie it is refused, mirroring the
   // bearer provider's refusal of cookie sessions.
-  const session = found && !isBearerSession(found) ? found : null;
+  const session = found && !isBearerSession(found) && deviceCheckApplied(config.store, found) ? found : null;
   return { session, csrfCookie };
+}
+
+/** The trusted device a session was minted on (`deviceAuth`), or null. */
+export function sessionBoundDeviceId(session: Session): string | null {
+  const auth = session.meta?.[AUTH_META_KEY] as { deviceId?: unknown } | undefined;
+  return typeof auth?.deviceId === 'string' ? auth.deviceId : null;
+}
+
+/**
+ * A session minted on a trusted device is only trusted when it was read
+ * through a `deviceBoundSessionStore()` — the one place that checks the
+ * device is still live. Read from any other store (a second `Auth` over the
+ * same table, an app wrapper around the wrapped store), it is refused.
+ */
+export function deviceCheckApplied(store: SessionStore, session: Session): boolean {
+  return sessionBoundDeviceId(session) === null || isRegisteredDeviceBoundStore(store);
 }
 
 /** Whether a session was minted with `transport: 'bearer'`. */

@@ -13,24 +13,24 @@
  * cost nothing extra.
  *
  * `deviceAuth()` refuses an `Auth` whose store is not wrapped, so the
- * guarantee cannot be lost by forgetting this.
+ * guarantee cannot be lost by forgetting this. The wrapped store is recorded
+ * in a registry (not marked with a property, which `Object.create()` would
+ * inherit), and the cookie middleware and `sessionBearer()` refuse a session
+ * carrying a `deviceId` that was read from any store not in it — so a second
+ * `Auth`, or an app wrapper laid over the top, cannot skip the device check.
+ * An app wrapper goes *inside*: `deviceBoundSessionStore(myWrapper(inner), …)`.
  */
 
-import { AUTH_META_KEY } from '../middleware.js';
+import { isRegisteredDeviceBoundStore, registerDeviceBoundStore } from '../device-bound.js';
+import { sessionBoundDeviceId } from '../middleware.js';
 import type { Clock, Session, SessionStore } from '../types.js';
 import type { DeviceAuthStore } from './store.js';
 
-const DEVICE_BOUND = Symbol('workers-auth.device-bound-session-store');
-
 export type DeviceBoundSessionStoreOptions = { clock?: Clock };
 
-function boundDeviceId(session: Session): string | null {
-  const auth = session.meta?.[AUTH_META_KEY] as { deviceId?: unknown } | undefined;
-  return typeof auth?.deviceId === 'string' ? auth.deviceId : null;
-}
-
+/** True only for an object `deviceBoundSessionStore()` returned — not for anything built on top of one. */
 export function isDeviceBoundSessionStore(store: SessionStore): boolean {
-  return (store as { [DEVICE_BOUND]?: unknown })[DEVICE_BOUND] === true;
+  return isRegisteredDeviceBoundStore(store);
 }
 
 export function deviceBoundSessionStore<S extends SessionStore>(
@@ -51,13 +51,12 @@ export function deviceBoundSessionStore<S extends SessionStore>(
   // (`cleanup()` on a D1 store, and anything added later) without listing it.
   const wrapped = Object.create(inner) as S;
   Object.defineProperties(wrapped, {
-    [DEVICE_BOUND]: { value: true },
     canRevokeAllForUser: { get: () => inner.canRevokeAllForUser },
     get: {
       value: async (sid: string): Promise<Session | null> => {
         const session = await inner.get(sid);
         if (!session) return null;
-        const deviceId = boundDeviceId(session);
+        const deviceId = sessionBoundDeviceId(session);
         if (deviceId === null) return session;
 
         const device = await devices.findDevice(deviceId);
@@ -75,5 +74,6 @@ export function deviceBoundSessionStore<S extends SessionStore>(
       },
     },
   });
+  registerDeviceBoundStore(wrapped);
   return wrapped;
 }

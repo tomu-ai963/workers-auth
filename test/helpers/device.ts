@@ -20,6 +20,14 @@ export const MIN = 60 * SEC;
 export const HOUR = 60 * MIN;
 export const DAY = 24 * HOUR;
 
+/**
+ * Per-test timeout for the request-heavy flows (enrolment, PIN hashing, many
+ * start/verify round trips). Under a full parallel run on a slow machine these
+ * can pass the 5 s default; the global testTimeout is left alone so that a
+ * light test that hangs still fails fast.
+ */
+export const HEAVY_TIMEOUT = 30_000;
+
 export const time = { now: T0 };
 export const clock = () => time.now;
 
@@ -154,4 +162,28 @@ export async function enrolled(h: Harness, email: string, pin = '482915', init: 
 
 export function pinLogin(h: Harness, c: Client, pin: string) {
   return call(h, c, 'POST', '/auth/device/pin/login', { pin });
+}
+
+/** A 6-digit code that is not the one last sent to `email`. */
+export function wrongCode(h: Harness, email: string): string {
+  return h.lastCode(email) === '000000' ? '111111' : '000000';
+}
+
+/**
+ * Spends `n` of a failure budget the only way that costs anything once a
+ * verify with no live code is free: request a code, guess wrong until its 5
+ * attempts are gone, wait past the attempt window, repeat. Leaves the clock
+ * past the last code's attempt window.
+ */
+export async function spendFailures(h: Harness, c: Client, email: string, n: number): Promise<void> {
+  let spent = 0;
+  while (spent < n) {
+    const start = await call(h, c, 'POST', '/auth/device/email/start', { email });
+    if (start.status !== 200) throw new Error(`email/start failed: ${start.status} ${JSON.stringify(start.body)}`);
+    for (let i = 0; i < 5 && spent < n; i++, spent++) {
+      const res = await call(h, c, 'POST', '/auth/device/email/verify', { email, code: wrongCode(h, email) });
+      if (res.status !== 401) throw new Error(`expected 401, got ${res.status} ${JSON.stringify(res.body)}`);
+    }
+    time.now += 11 * MIN;
+  }
 }
