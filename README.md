@@ -435,6 +435,15 @@ It throws, rather than letting a gap surface during an incident, unless:
    second `createAuth()` over the same table, say). If you wrap the store
    yourself (logging, metrics), put your wrapper **inside**:
    `deviceBoundSessionStore(myWrapper(d1SessionStore(env.DB)), devices)`.
+
+   **If you write your own provider (or any code) that reads sessions
+   directly, read them through the store `deviceBoundSessionStore()`
+   returned** — the same one given to `createAuth`. Calling `get()` on the raw
+   inner store skips the device check: a session minted on a revoked or
+   expired device comes back as if it were live. The SDK's own readers
+   (`auth.middleware()`, `readCookieSession`, `readBearerSession`,
+   `sessionBearer()`) refuse such sessions from an unwrapped store; code that
+   calls `store.get()` itself has no such guard.
 2. **The session store can `revokeAllForUser()`** (`canRevokeAllForUser`):
    `d1SessionStore`, or `kvSessionStore` with a `revocationList`.
    "Revoke all devices" and `revokeOtherDevicesOnChange` end every session of
@@ -604,9 +613,14 @@ failed verifications (across however many codes) per fixed 24-hour window.
 The window is fixed, not sliding: 10 per window, so up to 20 within 24 hours
 when they straddle a window boundary. Only a check against a live code
 counts — successful verifications, and verifies with no code to try (none
-sent, expired, or its 5 attempts already used), cost nothing. To spend the
-budget an attacker therefore has to request codes (which go to the owner's
-inbox) and guess against them.
+sent, expired, or its 5 attempts already used), cost nothing. A slot is taken
+only while the budget has one free, in the same statement that checks it, so
+a verify refused at the cap adds nothing either — however many arrive at
+once. To spend the budget an attacker therefore has to request codes (each
+one is emailed to the owner) and make wrong guesses against them: 10 wrong
+guesses on live codes, which takes at least two codes, since one code allows
+5 attempts and a resend within its 10 minutes keeps the attempts already
+used.
 
 Once the budget is spent, `/email/start` and `/email/verify` answer `429` for
 that address until the window ends — to every request that does not present
@@ -626,8 +640,11 @@ trusted device of the address can still recover**: a request that presents a
 valid (unrevoked, unexpired) device registered to that address is counted
 against that device's own budget — `emailCode.maxFailuresPerDevice` failures
 per window, plus its own resend cooldown and hourly send cap — and never
-against the address's. Someone without the device cannot spend that budget;
-someone who took the device gets that many tries and no more. So the owner
+against the address's. Someone without the device cannot spend that budget.
+Someone who took the device gets that budget *and* the address's, since they
+can always leave the device out: per window, `maxFailuresPerDevice` plus
+`maxFailuresPerEmail` guesses (10 + 10 = 20 by default), and 10 × (N + 1) with
+N stolen devices of the address. So the owner
 of a locked PIN asks for a code *from their trusted device*, verifies it
 there, and the PIN is unlocked. A user with no live trusted device has to wait
 out the window. That is the price of capping how many guesses an attacker gets

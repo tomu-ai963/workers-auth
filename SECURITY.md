@@ -274,20 +274,23 @@ subject of confirmed findings; see below.
   when they straddle a window boundary. The cap is reserved *before* a code is
   checked and given back on success, or when there was no live code to check
   (none, expired, or its attempts used up — nothing was compared, so nothing
-  is charged). Concurrent guesses cannot overshoot it. A request that presents
+  is charged). A slot is only taken while one is free; a verify refused at the
+  cap leaves the count untouched, so a burst of concurrent verifies can
+  neither overshoot the cap nor fill it without real wrong guesses. A request that presents
   a valid trusted device registered to the address is counted against that
   device's own budget (`maxFailuresPerDevice`, default 10 per window) instead,
   so the owner of a device can still verify — and unlock a PIN — when someone
   else has spent the address's budget. See Known limits for the residual risk
   in numbers and for the lock-out trade-off.
-- **Attempts are reserved before they are checked.** The 10-per-address,
-  5-per-code and 3-per-account limits each move their counter in the same
-  single statement that checks it (`UPSERT ... RETURNING count`,
-  `UPDATE ... WHERE attempts < max RETURNING`, `UPSERT ... DO UPDATE ... WHERE
+- **Attempts are reserved before they are checked.** The 10-per-address (and
+  per-device), 5-per-code and 3-per-account limits each move their counter in
+  the same single statement that checks it (`UPSERT ... DO UPDATE ... WHERE
+  count < max RETURNING`, `UPDATE ... WHERE attempts < max RETURNING`, `UPSERT ... DO UPDATE ... WHERE
   failed_count < max AND locked_at IS NULL RETURNING`), *before* the hash is
   compared. Twenty concurrent wrong PINs run at most three verifications;
   fifteen concurrent wrong codes get at most ten checked (with the per-code
-  limit raised so the address cap is what binds). Both are tested.
+  limit raised so the address cap is what binds). Both are tested, as is a
+  burst of 20 or 40 verifies with no code leaving the budget untouched.
 - **A PIN is only ever checked alongside a valid trusted device,** and the
   failure counter is only touched after that device has been proven. Someone
   who merely knows an address cannot lock that account's PIN login.
@@ -586,6 +589,13 @@ where it failed; it passes after the fix
   open it.
 - **[Fixed, P2] SecLists attribution.** Its MIT notice ships in
   `THIRD_PARTY_NOTICES`.
+- **[Fixed, was P1 — found re-checking `2491bdc`] A burst of no-code verifies
+  filled the budget.** The failure slot was taken unconditionally and a
+  request refused at the cap did not give it back, so requests that arrived
+  before earlier ones had been refunded stayed counted: 20 parallel verifies
+  with no code ever sent locked an address for 24 h. The slot is now taken by
+  a conditional statement that changes nothing at the cap (address and device
+  budgets alike).
 
 ## Known limits
 

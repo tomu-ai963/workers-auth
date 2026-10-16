@@ -82,7 +82,20 @@ export interface DeviceAuthStore {
   hitRateLimit(bucket: string, windowMs: number, now: number): Promise<{ count: number; windowStart: number }>;
   /** The current window's count without adding to it (0 when the window has lapsed). */
   readRateLimit(bucket: string, windowMs: number, now: number): Promise<{ count: number; windowStart: number }>;
-  /** Gives back one hit taken by `hitRateLimit`, if that window is still the current one. */
+  /**
+   * Takes one slot of a budget of `max` per fixed window, in one statement
+   * that both checks and moves the counter: at the cap it changes nothing and
+   * returns null. Unlike `hitRateLimit`, a refused request leaves no count
+   * behind, so a slot that is later given back with `refundRateLimit` is the
+   * only thing ever added — concurrent refused requests cannot pile up.
+   */
+  reserveRateLimit(
+    bucket: string,
+    windowMs: number,
+    now: number,
+    max: number,
+  ): Promise<{ count: number; windowStart: number } | null>;
+  /** Gives back one slot taken by `reserveRateLimit`, if that window is still the current one. */
   refundRateLimit(bucket: string, windowStart: number): Promise<void>;
 
   /**
@@ -223,6 +236,24 @@ export function d1DeviceAuthStore(
         .bind(bucket, now, now - windowMs)
         .first<{ count: number; window_start: number }>();
       return { count: row?.count ?? 1, windowStart: row?.window_start ?? now };
+    },
+
+    async reserveRateLimit(bucket, windowMs, now, max) {
+      // Same shape as reserveLoginAttempt: a DO UPDATE whose WHERE is false
+      // changes nothing and RETURNs no row — that empty result is the refusal.
+      // A lapsed window always restarts (at 1), whatever its old count.
+      const row = await db
+        .prepare(
+          `INSERT INTO ${limits} (bucket, window_start, count) VALUES (?1, ?2, 1)
+           ON CONFLICT(bucket) DO UPDATE SET
+             count        = CASE WHEN window_start <= ?3 THEN 1  ELSE count + 1   END,
+             window_start = CASE WHEN window_start <= ?3 THEN ?2 ELSE window_start END
+             WHERE window_start <= ?3 OR count < ?4
+           RETURNING count, window_start`,
+        )
+        .bind(bucket, now, now - windowMs, max)
+        .first<{ count: number; window_start: number }>();
+      return row ? { count: row.count, windowStart: row.window_start } : null;
     },
 
     async readRateLimit(bucket, windowMs, now) {

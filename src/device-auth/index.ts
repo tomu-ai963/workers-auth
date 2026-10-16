@@ -216,9 +216,11 @@ export type DeviceAuthOptions = {
      * registered to the address (unrevoked, unexpired): failed verifications
      * per device per `failureWindowSec`. Someone without the device cannot
      * spend it, so its owner can still get a code — and unlock a PIN — while
-     * the address budget is exhausted; someone who took the device gets this
-     * many tries and no more. The same device also gets its own resend
-     * cooldown and hourly send cap at `/email/start`. Default: 10.
+     * the address budget is exhausted. Someone who took the device gets this
+     * many tries *on top of* the address's `maxFailuresPerEmail` (they can
+     * always leave the device out): 10 + 10 per window by default, and
+     * 10 × (N + 1) with N stolen devices. The same device also gets its own
+     * resend cooldown and hourly send cap at `/email/start`. Default: 10.
      */
     maxFailuresPerDevice?: number;
     /** Default: 86,400 (24 hours). */
@@ -880,12 +882,15 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
       // Reserve a failure against the budget *before* checking anything, and
       // give it back on success — or when there turns out to be nothing to
       // check. Ten concurrent guesses therefore use ten reservations; the 11th
-      // is refused without being checked.
-      const slot = await store.hitRateLimit(budget.failures, failureWindowSec * SEC, now);
-      if (slot.count > budget.maxFailures) {
+      // is refused without being checked, and without adding to the count: a
+      // refused request must leave nothing behind, or a burst of no-code
+      // verifies would fill the budget faster than their refunds drain it.
+      const slot = await store.reserveRateLimit(budget.failures, failureWindowSec * SEC, now, budget.maxFailures);
+      if (!slot) {
         onEvent({ type: 'rate_limited', scope: `${budget.scope}_failures` });
+        const current = await store.readRateLimit(budget.failures, failureWindowSec * SEC, now);
         return c.json(
-          { error: 'rate_limited' as const, retryAfterSec: retryAfter(c, slot.windowStart, failureWindowSec, now) },
+          { error: 'rate_limited' as const, retryAfterSec: retryAfter(c, current.windowStart, failureWindowSec, now) },
           429,
         );
       }

@@ -108,6 +108,30 @@ describe('d1DeviceAuthStore', () => {
     expect(results.map((r) => r.count).sort((x, y) => x - y)).toEqual(Array.from({ length: 25 }, (_, i) => i + 1));
   });
 
+  it('reserveRateLimit stops at max without moving the count, and restarts with the window', async () => {
+    const s = store();
+    expect(await s.reserveRateLimit('r', 1000, NOW, 2)).toEqual({ count: 1, windowStart: NOW });
+    expect(await s.reserveRateLimit('r', 1000, NOW + 1, 2)).toEqual({ count: 2, windowStart: NOW });
+    expect(await s.reserveRateLimit('r', 1000, NOW + 2, 2)).toBeNull();
+    expect(await s.reserveRateLimit('r', 1000, NOW + 3, 2)).toBeNull();
+    expect(await s.readRateLimit('r', 1000, NOW + 3)).toEqual({ count: 2, windowStart: NOW });
+    // A refund frees exactly one slot.
+    await s.refundRateLimit('r', NOW);
+    expect(await s.reserveRateLimit('r', 1000, NOW + 4, 2)).toEqual({ count: 2, windowStart: NOW });
+    // A lapsed window restarts even from the cap.
+    expect(await s.reserveRateLimit('r', 1000, NOW + 1000, 2)).toEqual({ count: 1, windowStart: NOW + 1000 });
+  });
+
+  it('reserveRateLimit is exact under concurrency: 25 racing for 10 slots get exactly 10', async () => {
+    const s = store();
+    const results = await Promise.all(Array.from({ length: 25 }, () => s.reserveRateLimit('rc', 60_000, NOW, 10)));
+    expect(results.filter((r) => r !== null).map((r) => r!.count).sort((x, y) => x - y)).toEqual(
+      Array.from({ length: 10 }, (_, i) => i + 1),
+    );
+    expect(results.filter((r) => r === null)).toHaveLength(15);
+    expect(await s.readRateLimit('rc', 60_000, NOW)).toMatchObject({ count: 10 });
+  });
+
   it('touchDevice never extends past the absolute expiry and refuses an expired device', async () => {
     const s = store();
     await s.createDevice({

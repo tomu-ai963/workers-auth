@@ -141,8 +141,9 @@ describe('P1-A verification test E: a locked-out owner can recover', { timeout: 
     expect(h.events.at(-1)).toEqual({ type: 'rate_limited', scope: 'device_failures' });
 
     // The address budget was not touched, so a login without the device still works.
-    expect(await bucketCount('otp-fail:device:')).toBe(11);
-    expect(await bucketCount('otp-fail:')).toBe(11);
+    // 10 checked failures; the refused verify above added nothing.
+    expect(await bucketCount('otp-fail:device:')).toBe(10);
+    expect(await bucketCount('otp-fail:')).toBe(10);
     expect((await loginByEmail(h, client(), email)).status).toBe(200);
 
     // ...and the device budget lifts after the window.
@@ -237,6 +238,80 @@ describe('P1-A verification test E: a locked-out owner can recover', { timeout: 
     time.now += 61 * SEC;
     expect((await call(h, owner, 'POST', START, { email })).status).toBe(429);
     expect(h.events.at(-1)).toEqual({ type: 'rate_limited', scope: 'device_hourly' });
+  });
+});
+
+/** Guesses that were actually compared against a live code. */
+function comparedGuesses(h: Harness): number {
+  return h.events.filter(
+    (e) => e.type === 'email_code.failed' && ['mismatch', 'unknown_key', 'already_used'].includes(e.reason),
+  ).length;
+}
+
+async function failureCount(bucketPattern: string): Promise<number> {
+  const n = await env.DB.prepare('SELECT count FROM auth_rate_limits WHERE bucket LIKE ?1').bind(bucketPattern).first('count');
+  return Number(n ?? 0);
+}
+
+describe('P1-A (a) under concurrency: a refused request leaves no reservation behind', { timeout: HEAVY_TIMEOUT }, () => {
+  it.each([20, 40])('%i parallel no-code verifies (no device) do not spend the address budget', async (n) => {
+    const h = setup();
+    const email = `par${n}@example.com`;
+    const attacker = client({ ip: '198.51.100.9' });
+    await Promise.all(Array.from({ length: n }, () => call(h, attacker, 'POST', VERIFY, { email, code: '000000' })));
+    expect(h.sent).toHaveLength(0);
+    expect(comparedGuesses(h)).toBe(0);
+    expect(await failureCount('otp-fail:%')).toBe(0);
+    expect((await call(h, client(), 'POST', START, { email })).status).toBe(200);
+  });
+
+  it('parallel no-code verifies from a trusted device do not spend that device’s budget', async () => {
+    const h = setup();
+    const email = 'par-dev@example.com';
+    const owner = await enrolled(h, email, PIN);
+    await Promise.all(Array.from({ length: 40 }, () => call(h, owner, 'POST', VERIFY, { email, code: '000000' })));
+    expect(await failureCount('otp-fail:device:%')).toBe(0);
+    time.now += 61 * SEC;
+    expect((await call(h, owner, 'POST', START, { email })).status).toBe(200);
+  });
+
+  it('with 2 slots left, 20 parallel wrong guesses compare exactly 2; the rest get 429; the count stays at the cap', async () => {
+    const h = setup();
+    const email = 'two-left@example.com';
+    await spendFailures(h, client(), email, 8);
+    await call(h, client(), 'POST', START, { email });
+    const before = comparedGuesses(h);
+    const wrong = wrongCode(h, email);
+    const results = await Promise.all(Array.from({ length: 20 }, () => call(h, client(), 'POST', VERIFY, { email, code: wrong })));
+    expect(comparedGuesses(h) - before).toBe(2);
+    expect(results.filter((r) => r.status === 401)).toHaveLength(2);
+    expect(results.filter((r) => r.status === 429)).toHaveLength(18);
+    expect(await failureCount('otp-fail:%')).toBe(10);
+  });
+
+  it('the same, on the device budget', async () => {
+    const h = setup();
+    const email = 'two-left-dev@example.com';
+    const owner = await enrolled(h, email, PIN);
+    time.now += 61 * SEC;
+    await spendFailures(h, owner, email, 8);
+    await call(h, owner, 'POST', START, { email });
+    const before = comparedGuesses(h);
+    const wrong = wrongCode(h, email);
+    const results = await Promise.all(Array.from({ length: 20 }, () => call(h, owner, 'POST', VERIFY, { email, code: wrong })));
+    expect(comparedGuesses(h) - before).toBe(2);
+    expect(results.filter((r) => r.status === 429)).toHaveLength(18);
+    expect(await failureCount('otp-fail:device:%')).toBe(10);
+  });
+
+  it('a refused verify still reports retry-after for the current window', async () => {
+    const h = setup();
+    const email = 'retry@example.com';
+    await spendFailures(h, client(), email, 10);
+    const res = await call(h, client(), 'POST', VERIFY, { email, code: '123456' });
+    expect(res.status).toBe(429);
+    expect(Number(res.res.headers.get('retry-after'))).toBeGreaterThan(23 * 3600);
+    expect(await failureCount('otp-fail:%')).toBe(10);
   });
 });
 
