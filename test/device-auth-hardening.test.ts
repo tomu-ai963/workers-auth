@@ -242,11 +242,16 @@ describe('P0-2: device-bound sessions', () => {
     expect((await call(h, c, 'GET', '/api/me')).status).toBe(200);
   });
 
-  it('the programmatic revokeAllDevices ends sessions as well', async () => {
+  it('the programmatic revokeAllDevices ends sessions as well — including ones with no device', async () => {
     const h = setup({ transport: 'response' });
     const c = await enrolled(h, 'prog@example.com');
+    const noDevice = client();
+    time.now += 61 * SEC;
+    await loginByEmail(h, noDevice, 'prog@example.com', { trustDevice: false });
     await h.device.revokeAllDevices('prog@example.com');
     expect((await call(h, c, 'GET', '/api/me')).status).toBe(401);
+    // Only revokeAllForUser reaches this one: it is bound to no device.
+    expect((await call(h, noDevice, 'GET', '/api/me')).status).toBe(401);
   });
 
   it('refuses an Auth whose store is not device-bound', () => {
@@ -446,6 +451,17 @@ describe('P2-2: weak PINs', () => {
 
   it.each(['482915', '739164', '205817', '613094', '880241'])('still accepts %s', (p) => expect(isWeakPin(p)).toBe(false));
 
+  // Each of these is caught by exactly one rule, so each rule is tested on its own.
+  it.each([
+    ['388383', 'fewer than 3 distinct digits'],
+    ['772727', 'fewer than 3 distinct digits'],
+    ['384483', 'palindrome'],
+    ['529925', 'palindrome'],
+    ['369147', 'two keypad lines'],
+    ['963741', 'two keypad lines'],
+    ['580357', 'two keypad lines'],
+  ])('flags %s (%s)', (p) => expect(isWeakPin(p)).toBe(true));
+
   it('flags dates only when asked', () => {
     // DDMMYY, MMDDYY, YYMMDD, YYYYMM, MMYYYY — none weak by any other rule.
     for (const p of ['250394', '061287', '940325', '199507', '081994']) {
@@ -535,6 +551,31 @@ describe('P2-8: 4 KB body limit', () => {
       env,
     );
     expect(res.status).toBe(413);
+  });
+
+  it('refuses on a declared Content-Length alone, without reading the body', async () => {
+    const h = setup();
+    let pulled = false;
+    // highWaterMark 0: pull() runs only when someone actually reads, not to pre-fill a queue.
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull() {
+          pulled = true;
+          throw new Error('the body must not be read');
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const res = await h.app.fetch(
+      new Request(`${ORIGIN}/auth/device/email/start`, {
+        method: 'POST',
+        headers: { origin: ORIGIN, 'content-type': 'application/json', 'content-length': '5000' },
+        body: stream,
+      }),
+      env,
+    );
+    expect(res.status).toBe(413);
+    expect(pulled).toBe(false);
   });
 
   it('still accepts a normal body', async () => {
