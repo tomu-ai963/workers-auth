@@ -1,6 +1,6 @@
 {
   "name": "@tomu-ai/workers-auth",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Lightweight, secure auth session SDK for Cloudflare Workers + Hono. Thin client, server-held state, zero runtime dependencies.",
   "type": "module",
   "license": "MIT",
