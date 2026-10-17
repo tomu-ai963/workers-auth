@@ -405,10 +405,44 @@ What the stores rely on — each one is load-bearing for revocation or a limit:
   account (key: `hashtextextended('workers-auth:credential:' || account_id, 0)`;
   without it two concurrent PIN changes end in a unique violation), and
   clearing the lockout state is one statement that locks the row first.
+- **No retrying `fetch` under Neon HTTP.** Do not set
+  `neonConfig.fetchFunction` to a `fetch` that retries on its own. The stores
+  deliberately do not retry after a network error or timeout — the statement
+  may already have committed, and running a failure reservation twice would
+  charge it twice. The driver itself sends each query once (checked in
+  `@neondatabase/serverless` 1.2.0: one `fetch`, no retry loop); a retrying
+  `fetchFunction` would quietly reintroduce exactly that double run.
 
 `schema` (default `public`) selects where the tables live. It must match
 `^[a-z_][a-z0-9_]{0,62}$` and is checked when the store is built. Neon Auth's
 `neon_auth` schema is untouched either way; every table here is `auth_*`.
+
+**Cold starts.** A Neon compute that has scaled to zero adds its start-up to
+the first query that reaches it: about **0.7 s** on top of a normal first
+query, measured against a 0.25 CU test project in aws-ap-southeast-1 (first
+query after idle 1.18 s, first query from a fresh process on a running
+compute 0.45 s, warm queries ~0.1 s — from a development machine, not from a
+Worker). Authentication runs on every request, so the user who wakes the
+compute feels it; configure autosuspend accordingly for production.
+
+**A least-privilege role for auth.** The stores need no DDL, no `TRUNCATE`
+and no access to anything but their own tables. After the migrations, as the
+database owner (create the role itself in the Neon console or API):
+
+```sql
+GRANT USAGE ON SCHEMA public TO workers_auth_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+  auth_sessions, auth_email_codes, auth_trusted_devices, auth_credentials, auth_rate_limits
+  TO workers_auth_app;
+GRANT SELECT, INSERT, UPDATE ON auth_login_guards TO workers_auth_app;  -- never deleted from
+```
+
+With a `schema` other than `public`, grant on that schema and its tables
+instead. The advisory-lock and hashing functions the stores call are
+executable by every role by default. These grants are verified on a local
+PostgreSQL 17 by `test/pg-node/least-privilege.test.ts`: a role holding
+exactly them runs every store method, and `TRUNCATE`, DDL and other tables
+are refused (42501).
 
 ## Layer 2: providers
 
