@@ -12,14 +12,19 @@ import pg from 'pg';
 import { expect } from 'vitest';
 
 import type { PgExecutor } from '../../src/store/pg/index.js';
+import { assertOnlyAuthTables } from '../neon/guard.js';
 
 export const NOW = 1_700_000_000_000;
 export const DAY = 86_400_000;
 const LOCK_DB = 'workers_auth_locks';
 
+/** Real Neon (pnpm test:neon): its one database is used as is — nothing is created. */
+const NEON = process.env['WA_TEST_PG_TARGET'] === 'neon';
+
 function url(database: string): string {
   const base = process.env['WA_TEST_PG_URL'];
   if (!base) throw new Error('Postgres is not configured: run `pnpm pg:up` (test/pg/.env is missing)');
+  if (NEON) return base;
   const u = new URL(base);
   u.pathname = `/${database}`;
   return u.toString();
@@ -55,8 +60,13 @@ export type Connections = { a: pg.Client; b: pg.Client; monitor: pg.Client; bPid
 export async function connect(): Promise<Connections> {
   const admin = new pg.Client({ connectionString: url('workers_auth_test') });
   await admin.connect();
-  const exists = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [LOCK_DB]);
-  if (exists.rowCount === 0) await admin.query(`CREATE DATABASE ${LOCK_DB}`);
+  if (NEON) {
+    // Before any CREATE or TRUNCATE: the target must hold nothing but auth_* tables.
+    await assertOnlyAuthTables(async (text) => (await admin.query<{ name: unknown }>(text)).rows, 'node harness');
+  } else {
+    const exists = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [LOCK_DB]);
+    if (exists.rowCount === 0) await admin.query(`CREATE DATABASE ${LOCK_DB}`);
+  }
   await admin.end();
 
   const [a, b, monitor] = [0, 1, 2].map(() => new pg.Client({ connectionString: url(LOCK_DB) })) as [pg.Client, pg.Client, pg.Client];

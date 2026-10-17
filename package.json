@@ -78,6 +78,7 @@
     "test": "vitest run",
     "test:d1": "vitest run --project d1",
     "test:pg": "vitest run --project pg --project pg-node",
+    "test:neon": "node scripts/test-neon.mjs",
     "test:watch": "vitest",
     "pg:up": "node scripts/pg-test.mjs up",
     "pg:down": "node scripts/pg-test.mjs down"

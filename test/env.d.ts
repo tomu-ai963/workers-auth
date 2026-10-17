@@ -9,6 +9,8 @@ declare namespace Cloudflare {
     /** pg project only; empty when `pnpm pg:up` has not been run. */
     PG_URL: string;
     PG_HTTP_ENDPOINT: string;
+    /** 'only-auth-tables' against real Neon: see test/neon/guard.ts. */
+    PG_GUARD: string;
     PG_MIGRATIONS: Array<{ name: string; sql: string }>;
   }
 }

@@ -1276,6 +1276,13 @@ against Postgres through `@neondatabase/serverless` and the local proxy) and
 which an HTTP driver cannot do). Without `pnpm pg:up` the pg projects fail with
 a message saying so; they never skip.
 
+`pnpm test:neon` runs the same Postgres suites against a real Neon project
+instead, reading a direct (non-pooler) connection string from
+`test/pg/.env.neon` (`NEON_TEST_DATABASE_URL=...`, gitignored). Only that
+command targets Neon — plain `pnpm test` never reads the file — and it first
+refuses, before truncating or creating anything, any database that holds a
+table or view other than `auth_*`: point it at a dedicated test project only.
+
 Tests run on real Miniflare KV and D1. The `deviceAuth` suites use 1,000 PBKDF2
 iterations to stay fast; one test exercises the 100,000 default end to end. Stores, providers and `createAuth` all
 accept a `clock` option so expiry behaviour is tested deterministically instead

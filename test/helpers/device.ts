@@ -44,6 +44,8 @@ export type StoreOverrides = {
   deviceStore?: DeviceAuthStore;
   /** Wraps the raw session store *inside* deviceBoundSessionStore, e.g. to make a method fail. */
   wrapSessionStore?: (store: SessionStore) => SessionStore;
+  /** Replaces the raw session store (default: the backend's). */
+  sessionStore?: SessionStore;
 };
 
 export function setup(
@@ -54,7 +56,7 @@ export function setup(
   const events: AuthEvent[] = [];
   const sent: Array<{ email: string; code: string }> = [];
   const store = stores.deviceStore ?? makeDeviceStore({ clock });
-  const rawSessions = makeSessionStore({ clock });
+  const rawSessions = stores.sessionStore ?? makeSessionStore({ clock });
   const sessionStore = deviceBoundSessionStore(stores.wrapSessionStore?.(rawSessions) ?? rawSessions, store, { clock });
   const auth =
     overrides.auth ??

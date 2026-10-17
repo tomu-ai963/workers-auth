@@ -2,7 +2,14 @@
 // Fails — rather than skips — when Postgres is not configured or not reachable.
 import { env } from 'cloudflare:test';
 
-import { rawSql } from '../helpers/backend.js';
+import { rawRows, rawSql } from '../helpers/backend.js';
+import { assertOnlyAuthTables } from '../neon/guard.js';
+
+// Against real Neon: refuse to touch a database holding anything but auth_*
+// tables — before any CREATE here, and before any test's TRUNCATE.
+if (env.PG_GUARD === 'only-auth-tables') {
+  await assertOnlyAuthTables((text) => rawRows(text) as Promise<Array<{ name: unknown }>>, 'workerd setup');
+}
 
 for (const migration of env.PG_MIGRATIONS) {
   const statements = migration.sql

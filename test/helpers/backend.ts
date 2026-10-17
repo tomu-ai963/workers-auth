@@ -26,7 +26,9 @@ function pgUrl(): string {
 let neonClient: ReturnType<typeof neon<false, true>> | undefined;
 function sql() {
   if (!neonClient) {
-    neonConfig.fetchEndpoint = env.PG_HTTP_ENDPOINT;
+    // Local runs go through the Neon HTTP proxy; against real Neon (PG_HTTP_ENDPOINT
+    // empty) the driver derives the endpoint from the URL's host as in production.
+    if (env.PG_HTTP_ENDPOINT) neonConfig.fetchEndpoint = env.PG_HTTP_ENDPOINT;
     neonClient = neon(pgUrl(), { fullResults: true });
   }
   return neonClient;
@@ -35,6 +37,10 @@ function sql() {
 /** Raw driver access for test plumbing (DDL has no row count, so it bypasses the adapter). */
 export async function rawSql(text: string): Promise<void> {
   await sql().query(text, []);
+}
+
+export async function rawRows(text: string): Promise<Array<Record<string, unknown>>> {
+  return ((await sql().query(text, [])) as unknown as { rows: Array<Record<string, unknown>> }).rows;
 }
 
 /** A result with a numeric rowCount, or an error — never a null passed through as "0 rows". */
@@ -58,8 +64,10 @@ export function neonExecutor(): PgExecutor {
   };
 }
 
-export function makeSessionStore(options: { clock?: Clock } = {}) {
-  return BACKEND === 'pg' ? pgSessionStore(neonExecutor(), options) : d1SessionStore(env.DB, options);
+export function makeSessionStore(options: { clock?: Clock; executor?: PgExecutor } = {}) {
+  return BACKEND === 'pg'
+    ? pgSessionStore(options.executor ?? neonExecutor(), { clock: options.clock })
+    : d1SessionStore(env.DB, { clock: options.clock });
 }
 
 export function makeDeviceStore(options: D1DeviceAuthStoreOptions & { executor?: PgExecutor } = {}) {
