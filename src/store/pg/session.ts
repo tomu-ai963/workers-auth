@@ -11,9 +11,14 @@
 
 import { randomToken, sha256Hex } from '../../crypto.js';
 import type { Clock, NewSession, Session, SessionStore, SubjectType } from '../../types.js';
-import { affected, assertExecutor, num, retrying, type PgExecutor } from './executor.js';
+import { affected, assertExecutor, assertPgIdentifier, num, retrying, type PgExecutor } from './executor.js';
 
 export type PgSessionStoreOptions = {
+  /**
+   * Schema holding `auth_sessions`. Default: `public`. Must match
+   * `^[a-z_][a-z0-9_]{0,62}$`; anything else throws here.
+   */
+  schema?: string;
   clock?: Clock;
 };
 
@@ -62,7 +67,8 @@ function rowToSession(row: Row, sid: string): Session {
 export function pgSessionStore(executor: PgExecutor, options: PgSessionStoreOptions = {}): PgSessionStore {
   assertExecutor(executor, 'pgSessionStore');
   const db = retrying(executor);
-  const table = 'public.auth_sessions';
+  const schema = assertPgIdentifier(options.schema === undefined ? 'public' : options.schema, 'pgSessionStore: schema');
+  const table = `${schema}.auth_sessions`;
   const now: Clock = options.clock ?? Date.now;
 
   return {

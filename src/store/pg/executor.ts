@@ -33,6 +33,22 @@ export interface PgExecutor {
   transaction(statements: readonly PgStatement[]): Promise<PgQueryResult[]>;
 }
 
+const PG_IDENTIFIER_RE = /^[a-z_][a-z0-9_]{0,62}$/;
+
+/**
+ * The `schema` option is interpolated into SQL (an identifier cannot be a bind
+ * parameter), so only a plain lower-case Postgres identifier of at most 63
+ * bytes is accepted: no quotes, dots, spaces, semicolons or upper case (which
+ * Postgres would fold, so the name in the config would not be the name in the
+ * database). Anything else throws when the store is built.
+ */
+export function assertPgIdentifier(name: unknown, label: string): string {
+  if (typeof name !== 'string' || !PG_IDENTIFIER_RE.test(name)) {
+    throw new TypeError(`${label}: must match ^[a-z_][a-z0-9_]{0,62}$ (got ${JSON.stringify(name)})`);
+  }
+  return name;
+}
+
 export function assertExecutor(executor: unknown, label: string): asserts executor is PgExecutor {
   const e = executor as Partial<PgExecutor> | null;
   if (!e || typeof e.query !== 'function' || typeof e.transaction !== 'function') {

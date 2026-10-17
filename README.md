@@ -30,6 +30,7 @@ verification or D1 code:
 | `@tomu-ai/workers-auth` | `createAuth`, middleware, routes, types, crypto/cookie/csrf helpers |
 | `@tomu-ai/workers-auth/store/kv` | `kvSessionStore` |
 | `@tomu-ai/workers-auth/store/d1` | `d1SessionStore`, `revocationList` |
+| `@tomu-ai/workers-auth/store/pg` | `pgSessionStore`, `pgDeviceAuthStore` (Postgres: Neon, or any Postgres via Hyperdrive) — see [Postgres stores](#postgres-stores-storepg) |
 | `@tomu-ai/workers-auth/neon` | `neonAuth`, `clearJwksCache` |
 | `@tomu-ai/workers-auth/magic-link` | `magicLink`, `kvMagicLinkStore`, `d1MagicLinkStore` |
 | `@tomu-ai/workers-auth/api-key` | `apiKey`, `issueApiKey`, `kvApiKeyStore`, `d1ApiKeyStore` |
@@ -274,6 +275,107 @@ session. **The per-user marker has no expiry of its own** — deleting it early
 would silently un-revoke every session created before it — so cleanup keeps it
 around for `maxSessionLifetimeSec` (default 90 days; set it to the longest
 `absoluteTtlSec` you configure anywhere).
+
+### Postgres stores (`./store/pg`)
+
+For apps whose data already lives in Postgres (Neon), so auth does not need a
+D1 database of its own. `pgSessionStore(executor, options?)` and
+`pgDeviceAuthStore(executor, options?)` are drop-in counterparts of
+`d1SessionStore` and `d1DeviceAuthStore`: same interface, same limits, the
+same test suites (every `deviceAuth` test runs against both). There is no
+Postgres version of the magic-link, API-key or revocation-list stores.
+
+The package ships **no Postgres driver** and declares none, not even as a peer.
+You pass an *executor* — two functions — built from the driver you already use:
+
+```ts
+type PgExecutor = {
+  query(text: string, params: readonly unknown[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+  // Runs the statements in order in ONE transaction; all or nothing.
+  transaction(statements: readonly { text: string; params: readonly unknown[] }[]): Promise<{ rows; rowCount }[]>;
+};
+```
+
+**Neon over HTTP (`@neondatabase/serverless`) — the default.** One HTTPS round
+trip per query, no connection to open or close, nothing to set up per request:
+
+```ts
+import { neon } from '@neondatabase/serverless';
+import type { PgExecutor } from '@tomu-ai/workers-auth/store/pg';
+
+export function neonExecutor(databaseUrl: string): PgExecutor {
+  const sql = neon(databaseUrl, { fullResults: true });
+  return {
+    query: (text, params) => sql.query(text, [...params]),
+    transaction: (statements) =>
+      sql.transaction(statements.map((s) => sql.query(s.text, [...s.params])), { isolationLevel: 'ReadCommitted' }),
+  };
+}
+
+const executor = neonExecutor(env.DATABASE_URL); // a `wrangler secret`, the primary's connection string
+const devices = pgDeviceAuthStore(executor);
+const sessions = deviceBoundSessionStore(pgSessionStore(executor), devices);
+```
+
+**`pg` behind Hyperdrive.** Needs `nodejs_compat`; create the client per
+request and close it when the response is done:
+
+```ts
+import { Client } from 'pg';
+
+export function clientExecutor(client: Client): PgExecutor {
+  return {
+    query: (text, params) => client.query(text, [...params]),
+    async transaction(statements) {
+      await client.query('BEGIN');
+      try {
+        const results = [];
+        for (const s of statements) results.push(await client.query(s.text, [...s.params]));
+        await client.query('COMMIT');
+        return results;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      }
+    },
+  };
+}
+
+const client = new Client({ connectionString: env.HYPERDRIVE_AUTH.connectionString });
+await client.connect();
+ctx.waitUntil(/* after the response */ client.end());
+```
+
+Both adapters are the ones the test suite uses (the Neon one against a local
+Neon HTTP proxy, the `pg` one for the row-lock tests).
+
+What the stores rely on — each one is load-bearing for revocation or a limit:
+
+- **Hyperdrive must be created with `--caching-disabled`.** Hyperdrive caches
+  read queries for 60 s by default and does not invalidate them on writes, so
+  a cached `SELECT` would keep a revoked session, a revoked device or an old
+  rate-limit count alive. Use a separate cache-disabled configuration for auth
+  if the rest of the app wants caching:
+  `npx wrangler hyperdrive create auth-fresh --connection-string=... --caching-disabled`.
+- **No read replicas.** Point the executor at the primary (read-write)
+  endpoint. A replica's lag is the same stale read.
+- **READ COMMITTED** — Postgres' default. Every limit is one conditional
+  statement (`INSERT … ON CONFLICT DO UPDATE … WHERE … RETURNING`, or
+  `UPDATE … WHERE … RETURNING`), and READ COMMITTED is what makes such a
+  statement wait for a concurrent writer and then re-check its condition
+  against the row that writer left. A database whose default is REPEATABLE
+  READ or SERIALIZABLE turns that wait into an error (40001); the stores retry
+  a 40001 or 40P01 (deadlock) once — and nothing else, because after a network
+  error or timeout the statement may already have committed.
+- **Two spots that D1 got for free from its single writer** are handled
+  explicitly: replacing a PIN takes a transaction-scoped advisory lock on the
+  account (key: `hashtextextended('workers-auth:credential:' || account_id, 0)`;
+  without it two concurrent PIN changes end in a unique violation), and
+  clearing the lockout state is one statement that locks the row first.
+
+`schema` (default `public`) selects where the tables live. It must match
+`^[a-z_][a-z0-9_]{0,62}$` and is checked when the store is built. Neon Auth's
+`neon_auth` schema is untouched either way; every table here is `auth_*`.
 
 ## Layer 2: providers
 
@@ -860,6 +962,28 @@ D1 migrations ship in `migrations/`. Apply only what you use:
 npx wrangler d1 migrations apply <db> --local
 ```
 
+**Postgres:** `migrations/pg/` holds the same files with the same numbers
+(times are `BIGINT` milliseconds, counters `INTEGER`, JSON `TEXT`). The stores
+need `0001_sessions.sql` and `0006_device_auth.sql`; `0002`–`0005` create the
+tables of the D1/KV-only stores so both schemas stay alike. There is no
+migration runner on Neon's side — apply them in order with any client, for
+example:
+
+```bash
+for f in node_modules/@tomu-ai/workers-auth/migrations/pg/000{1,6}_*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
+```
+
+For a schema other than `public`, create it and apply with that search path
+(table names in the files are unqualified), then pass the same `schema`:
+
+```bash
+psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS workers_auth'
+PGOPTIONS='-c search_path=workers_auth' psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f .../0006_device_auth.sql
+```
+
+A test (`test/pg/schema.test.ts`) fails if the D1 and Postgres files ever
+disagree on a table, column, nullability, primary key or index.
+
 ## Testing your integration
 
 ### Prefer real KV/D1 over hand-rolled fakes
@@ -1105,9 +1229,19 @@ own migrations, apply both directories in `apply-migrations.ts`.
 ```bash
 pnpm install
 pnpm typecheck
-pnpm test        # vitest + @cloudflare/vitest-pool-workers (runs on workerd)
+pnpm pg:up       # Docker: postgres:17 + a local Neon HTTP proxy (random password in test/pg/.env)
+pnpm test        # all three vitest projects, one after another (below)
+pnpm test:d1     # D1 only — no Docker needed
+pnpm pg:down     # stop Postgres and delete its data and password file
 pnpm build       # tsup, ESM + d.ts
 ```
+
+Three vitest projects: **d1** (everything, on workerd with Miniflare KV/D1),
+**pg** (the `deviceAuth` suites and the store contract again, on workerd,
+against Postgres through `@neondatabase/serverless` and the local proxy) and
+**pg-node** (Node + `pg`: row-lock interleavings on two held-open connections,
+which an HTTP driver cannot do). Without `pnpm pg:up` the pg projects fail with
+a message saying so; they never skip.
 
 Tests run on real Miniflare KV and D1. The `deviceAuth` suites use 1,000 PBKDF2
 iterations to stay fast; one test exercises the 100,000 default end to end. Stores, providers and `createAuth` all

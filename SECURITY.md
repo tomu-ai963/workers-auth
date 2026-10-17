@@ -361,6 +361,35 @@ Every D1 query uses bound parameters. The only interpolated values are table
 names, which are validated against `^[A-Za-z_][A-Za-z0-9_]*$` at construction and
 throw otherwise.
 
+The Postgres stores likewise bind every value (`$1`…). The one interpolated
+name is the `schema` option, checked against `^[a-z_][a-z0-9_]{0,62}$` when
+the store is built (no quotes, dots, whitespace, semicolons or upper case);
+table names are fixed.
+
+### Postgres stores (`./store/pg`)
+
+The guarantees above hold on Postgres under these conditions, which are the
+app's to meet (README → Postgres stores):
+
+- **Fresh reads.** The executor must reach the primary with no query cache:
+  Hyperdrive only with `--caching-disabled`, no read replica. A cached or
+  lagging `SELECT` keeps a revoked session or device alive and lets a rate
+  limit read an old count.
+- **READ COMMITTED.** Each limit is one conditional statement; under READ
+  COMMITTED a statement that meets a row locked by a concurrent writer waits,
+  then re-evaluates its condition against the row as that writer committed it
+  (PostgreSQL docs, 13.2.1). Tested deterministically for all seven
+  conditional statements by holding a row lock on one connection and running
+  the statement on another (`test/pg-node/locks.test.ts`).
+- **What D1's single writer gave for free** is made explicit: PIN replacement
+  serialises per account with `pg_advisory_xact_lock` (without it, two
+  concurrent changes fail with a unique violation — reproduced in
+  `test/pg-node/races.test.ts`), and `resetLoginGuard` locks the row before
+  reading the state it reports.
+- **Retries:** once, and only on 40001 / 40P01, which Postgres raises after
+  rolling the transaction back. Never on network errors or timeouts, where the
+  statement may have committed and a reservation would be charged twice.
+
 ## Fixed findings (2026-08 review)
 
 Each of these was reproduced with a proof-of-concept before the fix, and the
@@ -704,6 +733,27 @@ Read these before shipping.
 17. **Weak-PIN detection is a blocklist, not a guarantee.** It covers the
     structural patterns and common picks listed above; birthdays are only
     refused with `pin.rejectDateLike`.
+
+### Postgres stores
+
+18. **Tested against a local Neon HTTP proxy, not Neon itself.** The suites
+    run through `@neondatabase/serverless` against `local-neon-http-proxy` in
+    front of PostgreSQL 17, and through `pg` directly. Neon's real HTTP
+    endpoint, its connection pooler, compute cold starts and other Postgres
+    versions have not been exercised; a run against a test Neon branch is the
+    remaining check.
+19. **A transient network error surfaces as a 500.** It is deliberately not
+    retried (see above), so a request can fail where a retry would have
+    worked; the client retries the request instead.
+20. **The advisory-lock key space is shared with the app.** The key is
+    `hashtextextended('workers-auth:credential:' || account_id, 0)`; an app
+    taking advisory locks with colliding 64-bit keys on the same database
+    would only add waiting, never break correctness.
+21. **Latency is per query.** Over Neon HTTP every statement is a round trip
+    from the Worker to the database region: an authenticated request on a
+    trusted device costs two or three (the session, its device, an occasional
+    sliding-expiry update), an email verification about fifteen. A suspended
+    Neon compute adds its cold start to the first one.
 
 ## Reporting
 

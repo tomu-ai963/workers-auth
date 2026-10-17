@@ -36,9 +36,23 @@ import type {
 } from '../../device-auth/store.js';
 import type { CredentialMaterial, CredentialType } from '../../device-auth/credentials.js';
 import type { Clock } from '../../types.js';
-import { affected, assertExecutor, num, numOrNull, retrying, type PgExecutor, type PgStatement } from './executor.js';
+import {
+  affected,
+  assertExecutor,
+  assertPgIdentifier,
+  num,
+  numOrNull,
+  retrying,
+  type PgExecutor,
+  type PgStatement,
+} from './executor.js';
 
 export type PgDeviceAuthStoreOptions = {
+  /**
+   * Schema holding the auth_* tables of migrations/pg/0006. Default:
+   * `public`. Must match `^[a-z_][a-z0-9_]{0,62}$`; anything else throws here.
+   */
+  schema?: string;
   clock?: Clock;
 };
 
@@ -133,11 +147,12 @@ export function pgDeviceAuthStore(
 ): DeviceAuthStore & DeviceAuthStoreCleanup {
   assertExecutor(executor, 'pgDeviceAuthStore');
   const db = retrying(executor);
-  const codes = 'public.auth_email_codes';
-  const devices = 'public.auth_trusted_devices';
-  const creds = 'public.auth_credentials';
-  const guards = 'public.auth_login_guards';
-  const limits = 'public.auth_rate_limits';
+  const schema = assertPgIdentifier(options.schema === undefined ? 'public' : options.schema, 'pgDeviceAuthStore: schema');
+  const codes = `${schema}.auth_email_codes`;
+  const devices = `${schema}.auth_trusted_devices`;
+  const creds = `${schema}.auth_credentials`;
+  const guards = `${schema}.auth_login_guards`;
+  const limits = `${schema}.auth_rate_limits`;
   const clock: Clock = options.clock ?? Date.now;
   const q = db.query.bind(db);
 
