@@ -30,6 +30,7 @@
 import type {
   CircuitBreakerState,
   CredentialRecord,
+  ReplaceCredentialResult,
   DeviceAuthStore,
   DeviceAuthStoreCleanup,
   DeviceRecord,
@@ -129,7 +130,8 @@ export function replaceCredentialStatements(table: string, r: CredentialRecord):
     },
     {
       text: `UPDATE ${table} SET revoked_at = $3, updated_at = $3
-              WHERE account_id = $1 AND type = $2 AND revoked_at IS NULL`,
+              WHERE account_id = $1 AND type = $2 AND revoked_at IS NULL
+              RETURNING credential_id`,
       params: [r.accountId, r.type, r.updatedAt],
     },
     {
@@ -319,22 +321,25 @@ export function pgDeviceAuthStore(
       });
     },
 
+    // Decisions are read from RETURNING rows, never from rowCount (see executor.ts).
     async revokeDevice(accountId, deviceId, now) {
-      const result = await q(
+      const { rows } = await q(
         `UPDATE ${devices} SET revoked_at = $3
-          WHERE device_id = $1 AND account_id = $2 AND revoked_at IS NULL`,
+          WHERE device_id = $1 AND account_id = $2 AND revoked_at IS NULL
+          RETURNING device_id`,
         [deviceId, accountId, now],
       );
-      return affected(result) > 0;
+      return rows.length > 0;
     },
 
     async revokeAllDevices(accountId, now, exceptDeviceId) {
-      const result = await q(
+      const { rows } = await q(
         `UPDATE ${devices} SET revoked_at = $2
-          WHERE account_id = $1 AND revoked_at IS NULL AND device_id IS DISTINCT FROM $3::text`,
+          WHERE account_id = $1 AND revoked_at IS NULL AND device_id IS DISTINCT FROM $3::text
+          RETURNING device_id`,
         [accountId, now, exceptDeviceId ?? null],
       );
-      return affected(result);
+      return rows.length;
     },
 
     async getActiveCredential(accountId, type) {
@@ -358,11 +363,36 @@ export function pgDeviceAuthStore(
       } satisfies CredentialRecord;
     },
 
-    async replaceCredential(r) {
-      // One transaction: the partial unique index allows only one live PIN,
-      // so the old one has to be revoked before the insert, never after.
-      const [, revoked] = await db.transaction(replaceCredentialStatements(creds, r));
-      return (revoked ? affected(revoked) : 0) > 0;
+    async replaceCredential(r, options = {}): Promise<ReplaceCredentialResult> {
+      // One transaction, after the account's advisory lock: [lock, (revoke
+      // the other devices — only while a live credential still exists, i.e.
+      // one is being replaced), revoke the old credential, insert the new
+      // one, (clear the login guard)]. All of it or none. Outcomes are read
+      // from RETURNING rows, not rowCount.
+      const [lock, revoke, insert] = replaceCredentialStatements(creds, r) as [PgStatement, PgStatement, PgStatement];
+      const statements: PgStatement[] = [lock];
+      if (options.revokeOtherDevices) {
+        statements.push({
+          text: `UPDATE ${devices} SET revoked_at = $2
+                  WHERE account_id = $1 AND revoked_at IS NULL AND device_id IS DISTINCT FROM $3::text
+                    AND EXISTS (SELECT 1 FROM ${creds} WHERE account_id = $1 AND type = $4 AND revoked_at IS NULL)
+                  RETURNING device_id`,
+          params: [r.accountId, r.updatedAt, options.revokeOtherDevices.exceptDeviceId, r.type],
+        });
+      }
+      const revokeAt = statements.length;
+      statements.push(revoke, insert);
+      if (options.resetLoginGuard) {
+        statements.push({
+          text: `UPDATE ${guards} SET failed_count = 0, locked_at = NULL, updated_at = $2 WHERE account_id = $1`,
+          params: [r.accountId, r.updatedAt],
+        });
+      }
+      const results = await db.transaction(statements);
+      return {
+        replaced: (results[revokeAt]?.rows.length ?? 0) > 0,
+        devicesRevoked: options.revokeOtherDevices ? (results[1]?.rows.length ?? 0) : 0,
+      };
     },
 
     async markCredentialUsed(credentialId, now, material) {

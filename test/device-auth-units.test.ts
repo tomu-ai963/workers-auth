@@ -160,8 +160,8 @@ describe('d1DeviceAuthStore', () => {
       updatedAt: NOW,
       lastUsedAt: null,
     });
-    expect(await s.replaceCredential(cred('p1', 'pin'))).toBe(false);
-    expect(await s.replaceCredential(cred('p2', 'pin'))).toBe(true);
+    expect(await s.replaceCredential(cred('p1', 'pin'))).toEqual({ replaced: false, devicesRevoked: 0 });
+    expect(await s.replaceCredential(cred('p2', 'pin'))).toEqual({ replaced: true, devicesRevoked: 0 });
     expect((await s.getActiveCredential('acct', 'pin'))?.credentialId).toBe('p2');
     expect(await db.prepare("SELECT COUNT(*) AS n FROM auth_credentials WHERE revoked_at IS NULL AND type = 'pin'").first('n')).toBe(1);
 

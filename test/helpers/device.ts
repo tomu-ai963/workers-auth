@@ -6,9 +6,11 @@ import {
   deviceAuth,
   deviceBoundSessionStore,
   type DeviceAuthOptions,
+  type DeviceAuthStore,
 } from '../../src/device-auth/index.js';
 import { createAuth, getUser, type AuthEvent, type CreateAuthOptions } from '../../src/index.js';
 import { sessionBearer } from '../../src/providers/session-bearer.js';
+import type { SessionStore } from '../../src/types.js';
 import { cookieHeader, readCookieJar, type CookieJar } from '../../src/testing.js';
 import { BACKEND, makeDeviceStore, makeSessionStore } from './backend.js';
 
@@ -37,14 +39,23 @@ export const SECRET_B = randomToken(32);
 
 export type Harness = ReturnType<typeof setup>;
 
+export type StoreOverrides = {
+  /** Replaces the device-auth store (default: the backend's, see helpers/backend.ts). */
+  deviceStore?: DeviceAuthStore;
+  /** Wraps the raw session store *inside* deviceBoundSessionStore, e.g. to make a method fail. */
+  wrapSessionStore?: (store: SessionStore) => SessionStore;
+};
+
 export function setup(
   overrides: Partial<DeviceAuthOptions> = {},
   authOverrides: Partial<CreateAuthOptions> = {},
+  stores: StoreOverrides = {},
 ) {
   const events: AuthEvent[] = [];
   const sent: Array<{ email: string; code: string }> = [];
-  const store = makeDeviceStore({ clock });
-  const sessionStore = deviceBoundSessionStore(makeSessionStore({ clock }), store, { clock });
+  const store = stores.deviceStore ?? makeDeviceStore({ clock });
+  const rawSessions = makeSessionStore({ clock });
+  const sessionStore = deviceBoundSessionStore(stores.wrapSessionStore?.(rawSessions) ?? rawSessions, store, { clock });
   const auth =
     overrides.auth ??
     createAuth({

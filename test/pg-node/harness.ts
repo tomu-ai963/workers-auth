@@ -25,15 +25,21 @@ function url(database: string): string {
   return u.toString();
 }
 
+/** pg reports `rowCount: null` for commands without a count; the stores need a number. */
+function counted<R extends pg.QueryResultRow>(r: pg.QueryResult<R>) {
+  if (r.rowCount === null) throw new Error(`pg: no row count for ${r.command}`);
+  return { rows: r.rows, rowCount: r.rowCount };
+}
+
 /** The README's adapter for a `pg` Client (Hyperdrive), verbatim. */
 export function clientExecutor(client: pg.Client): PgExecutor {
   return {
-    query: (text, params) => client.query(text, [...params]),
+    query: async (text, params) => counted(await client.query(text, [...params])),
     async transaction(statements) {
       await client.query('BEGIN');
       try {
         const results = [];
-        for (const s of statements) results.push(await client.query(s.text, [...s.params]));
+        for (const s of statements) results.push(counted(await client.query(s.text, [...s.params])));
         await client.query('COMMIT');
         return results;
       } catch (error) {

@@ -16,14 +16,24 @@
  *     (a Hyperdrive configuration must be created with `--caching-disabled`).
  *     A stale read lets a revoked device or session through.
  *   - Errors carry the SQLSTATE in `code` (both drivers do).
+ *   - `rowCount` is a number (see PgQueryResult).
+ *   - Used in autocommit, never inside a transaction the app opened: a
+ *     rollback there would also undo the failure reservations, giving PIN and
+ *     code guesses back. And one connection per request — a `pg` Client is
+ *     not shared across requests.
  */
 
 export type PgRow = Record<string, unknown>;
 
 export type PgQueryResult<R extends PgRow = PgRow> = {
   rows: R[];
-  /** Rows affected (INSERT/UPDATE/DELETE) or returned (SELECT). */
-  rowCount: number | null;
+  /**
+   * Rows affected (INSERT/UPDATE/DELETE) or returned (SELECT), as a number.
+   * Required: an adapter must not pass a driver's null through. The stores
+   * decide anything security-relevant from RETURNING rows, and refuse a
+   * non-numeric count where they still read one (cleanup totals).
+   */
+  rowCount: number;
 };
 
 export type PgStatement = { text: string; params: readonly unknown[] };
@@ -71,9 +81,17 @@ export function numOrNull(value: unknown): number | null {
   return value === null || value === undefined ? null : num(value);
 }
 
-/** Rows affected, treating a driver's null as none. */
+/**
+ * Rows affected. Throws unless the driver reported a finite number: reading a
+ * missing count as 0 would make "nothing happened" out of "unknown". Only used
+ * for counts that decide nothing (cleanup totals); decisions use RETURNING.
+ */
 export function affected(result: PgQueryResult): number {
-  return result.rowCount ?? 0;
+  const n = (result as { rowCount: unknown }).rowCount;
+  if (typeof n !== 'number' || !Number.isFinite(n)) {
+    throw new TypeError(`PgExecutor returned rowCount ${String(n)}; it must report affected rows as a number`);
+  }
+  return n;
 }
 
 const RETRYABLE_SQLSTATES = new Set(['40001', '40P01']);

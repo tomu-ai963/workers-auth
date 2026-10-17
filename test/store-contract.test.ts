@@ -12,7 +12,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { CredentialRecord, DeviceAuthStore, DeviceAuthStoreCleanup, DeviceRecord } from '../src/device-auth/store.js';
 import type { SessionStore } from '../src/types.js';
-import { BACKEND, db, makeDeviceStore, makeSessionStore } from './helpers/backend.js';
+import { BACKEND, db, failDeviceRevocation, makeDeviceStore, makeSessionStore } from './helpers/backend.js';
 import { HEAVY_TIMEOUT } from './helpers/device.js';
 import { resetStorage } from './helpers/reset.js';
 
@@ -238,8 +238,11 @@ function storeContract(name: string, make: () => DeviceAuthStore & DeviceAuthSto
       it('replaceCredential keeps one live PIN and reports whether it replaced one', async () => {
         const s = make();
         expect(await s.getActiveCredential('acct', 'pin')).toBeNull();
-        expect(await s.replaceCredential(credential('p1'))).toBe(false);
-        expect(await s.replaceCredential(credential('p2', { createdAt: NOW + 1, updatedAt: NOW + 1 }))).toBe(true);
+        expect(await s.replaceCredential(credential('p1'))).toEqual({ replaced: false, devicesRevoked: 0 });
+        expect(await s.replaceCredential(credential('p2', { createdAt: NOW + 1, updatedAt: NOW + 1 }))).toEqual({
+          replaced: true,
+          devicesRevoked: 0,
+        });
         expect(await s.getActiveCredential('acct', 'pin')).toEqual(credential('p2', { createdAt: NOW + 1, updatedAt: NOW + 1 }));
         expect(await db.prepare("SELECT COUNT(*) AS n FROM auth_credentials WHERE revoked_at IS NULL").first('n')).toBe(1);
       });
@@ -258,6 +261,56 @@ function storeContract(name: string, make: () => DeviceAuthStore & DeviceAuthSto
         await s.replaceCredential(credential('k1', { type: 'passkey', deviceId: 'd1' }));
         await s.replaceCredential(credential('k2', { type: 'passkey', deviceId: 'd2' }));
         expect(await s.getActiveCredential('acct', 'pin')).toMatchObject({ credentialId: 'p1' });
+      });
+
+      it('revokeOtherDevices revokes all but the kept device — only when a credential is replaced', async () => {
+        const s = make();
+        for (const id of ['a', 'b', 'c']) await s.createDevice(device({ deviceId: id.repeat(32) }));
+        await s.createDevice(device({ deviceId: 'd'.repeat(32), accountId: 'other' }));
+        const keep = { revokeOtherDevices: { exceptDeviceId: 'a'.repeat(32) } };
+        // First PIN: nothing replaced, nothing revoked.
+        expect(await s.replaceCredential(credential('p1'), keep)).toEqual({ replaced: false, devicesRevoked: 0 });
+        expect((await s.listDevices('acct', NOW)).map((d) => d.deviceId)).toEqual(['a', 'b', 'c'].map((x) => x.repeat(32)));
+        // A change: the other two go, the kept one and another account's stay.
+        expect(await s.replaceCredential(credential('p2', { updatedAt: NOW + 1 }), keep)).toEqual({ replaced: true, devicesRevoked: 2 });
+        expect((await s.listDevices('acct', NOW)).map((d) => d.deviceId)).toEqual(['a'.repeat(32)]);
+        expect(await s.findDevice('b'.repeat(32))).toMatchObject({ revokedAt: NOW + 1 });
+        expect((await s.listDevices('other', NOW)).map((d) => d.deviceId)).toEqual(['d'.repeat(32)]);
+        // exceptDeviceId: null revokes every device of the account.
+        expect(await s.replaceCredential(credential('p3'), { revokeOtherDevices: { exceptDeviceId: null } })).toEqual({
+          replaced: true,
+          devicesRevoked: 1,
+        });
+      });
+
+      it('resetLoginGuard clears the failure count and lock in the same call', async () => {
+        const s = make();
+        await s.reserveLoginAttempt('acct', 3, NOW);
+        await s.reserveLoginAttempt('acct', 3, NOW);
+        await s.lockAccount('acct', 2, NOW);
+        await s.replaceCredential(credential('p1'));
+        expect(await s.readLoginGuard('acct')).toEqual({ failedCount: 2, lockedAt: NOW });
+        await s.replaceCredential(credential('p2'), { resetLoginGuard: true });
+        expect(await s.readLoginGuard('acct')).toEqual({ failedCount: 0, lockedAt: null });
+      });
+
+      it('is all or nothing: when revoking the devices fails, the PIN and the guard are untouched', async () => {
+        const s = make();
+        await s.createDevice(device({ deviceId: 'b'.repeat(32) }));
+        await s.replaceCredential(credential('p1'));
+        await s.reserveLoginAttempt('acct', 3, NOW);
+        const restore = await failDeviceRevocation();
+        try {
+          await expect(
+            s.replaceCredential(credential('p2'), { resetLoginGuard: true, revokeOtherDevices: { exceptDeviceId: null } }),
+          ).rejects.toThrow();
+        } finally {
+          await restore();
+        }
+        expect(await s.getActiveCredential('acct', 'pin')).toMatchObject({ credentialId: 'p1' });
+        expect(await db.prepare("SELECT COUNT(*) AS n FROM auth_credentials WHERE credential_id = 'p2'").first('n')).toBe(0);
+        expect(await s.readLoginGuard('acct')).toEqual({ failedCount: 1, lockedAt: null });
+        expect(await s.findDevice('b'.repeat(32))).toMatchObject({ revokedAt: null });
       });
 
       it('markCredentialUsed sets last use, and swaps the material only when given one', async () => {

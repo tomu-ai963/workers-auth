@@ -290,11 +290,19 @@ You pass an *executor* — two functions — built from the driver you already u
 
 ```ts
 type PgExecutor = {
-  query(text: string, params: readonly unknown[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+  // One statement, autocommit. rowCount: affected/returned rows, as a number.
+  query(text: string, params: readonly unknown[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number }>;
   // Runs the statements in order in ONE transaction; all or nothing.
   transaction(statements: readonly { text: string; params: readonly unknown[] }[]): Promise<{ rows; rowCount }[]>;
 };
 ```
+
+**`rowCount` must be a number (required).** Drivers can report `null` (`pg`
+does for commands without a count). Throw in the adapter rather than passing
+`null` on or turning it into `0`: "unknown" read as "no rows" is how a PIN
+change could quietly skip signing the other devices out. The stores decide
+everything that matters from `RETURNING` rows, and throw if a count they do
+read (cleanup totals) is not a finite number — the adapters below do the same.
 
 **Neon over HTTP (`@neondatabase/serverless`) — the default.** One HTTPS round
 trip per query, no connection to open or close, nothing to set up per request:
@@ -303,12 +311,19 @@ trip per query, no connection to open or close, nothing to set up per request:
 import { neon } from '@neondatabase/serverless';
 import type { PgExecutor } from '@tomu-ai/workers-auth/store/pg';
 
+function counted(r: { rows: Record<string, unknown>[]; rowCount: number | null }) {
+  if (typeof r.rowCount !== 'number') throw new Error('neon: no row count in the result');
+  return { rows: r.rows, rowCount: r.rowCount };
+}
+
 export function neonExecutor(databaseUrl: string): PgExecutor {
   const sql = neon(databaseUrl, { fullResults: true });
   return {
-    query: (text, params) => sql.query(text, [...params]),
-    transaction: (statements) =>
-      sql.transaction(statements.map((s) => sql.query(s.text, [...s.params])), { isolationLevel: 'ReadCommitted' }),
+    query: async (text, params) => counted(await sql.query(text, [...params])),
+    transaction: async (statements) =>
+      (
+        await sql.transaction(statements.map((s) => sql.query(s.text, [...s.params])), { isolationLevel: 'ReadCommitted' })
+      ).map(counted),
   };
 }
 
@@ -321,16 +336,21 @@ const sessions = deviceBoundSessionStore(pgSessionStore(executor), devices);
 request and close it when the response is done:
 
 ```ts
-import { Client } from 'pg';
+import { Client, type QueryResult } from 'pg';
+
+function counted(r: QueryResult) {
+  if (r.rowCount === null) throw new Error(`pg: no row count for ${r.command}`);
+  return { rows: r.rows, rowCount: r.rowCount };
+}
 
 export function clientExecutor(client: Client): PgExecutor {
   return {
-    query: (text, params) => client.query(text, [...params]),
+    query: async (text, params) => counted(await client.query(text, [...params])),
     async transaction(statements) {
       await client.query('BEGIN');
       try {
         const results = [];
-        for (const s of statements) results.push(await client.query(s.text, [...s.params]));
+        for (const s of statements) results.push(counted(await client.query(s.text, [...s.params])));
         await client.query('COMMIT');
         return results;
       } catch (error) {
@@ -350,6 +370,19 @@ Both adapters are the ones the test suite uses (the Neon one against a local
 Neon HTTP proxy, the `pg` one for the row-lock tests).
 
 What the stores rely on — each one is load-bearing for revocation or a limit:
+
+- **Autocommit only — never inside a transaction your app opened.** Every
+  limit reserves its failure *before* checking a PIN or code, in a statement
+  that commits on its own. Run the executor inside an app transaction and a
+  rollback (an error later in the request, or the app's own) undoes those
+  reservations: the guesses come back, and the PIN and email-code limits stop
+  limiting. `query()` must be one autocommitted statement; `transaction()`
+  must open and commit its own transaction. There is no reliable way for the
+  store to detect the misuse itself (see SECURITY.md), so it is on the adapter.
+- **One connection per request; do not share a `pg` Client across
+  requests.** A shared client mixes requests' statements on one session —
+  including into whatever transaction another request has open — which is the
+  previous point by accident. (Neon HTTP has no connection to share.)
 
 - **Hyperdrive must be created with `--caching-disabled`.** Hyperdrive caches
   read queries for 60 s by default and does not invalidate them on writes, so
@@ -694,7 +727,7 @@ unescaped label in a "your devices" page is a stored XSS.
 | `pin.maxAttempts` | 3 | consecutive failures before lockout, per account |
 | `pin.isWeakPin` | — | extra rule, on top of the built-in one |
 | `pin.rejectDateLike` | `false` | also refuse DDMMYY / MMDDYY / YYMMDD / YYYYMM / MMYYYY |
-| `pin.revokeOtherDevicesOnChange` | `false` | on replacing an existing PIN: revoke the other devices **and every session of the account**, including the caller's (`signedOut: true`; the current device stays trusted, so it logs in again with the new PIN) |
+| `pin.revokeOtherDevicesOnChange` | `false` | on replacing an existing PIN: revoke the other devices **and every session of the account**, including the caller's (`signedOut: true`; the current device stays trusted, so it logs in again with the new PIN). The new PIN and the devices' revocation are one transaction: both happen or neither |
 | `emailCode.ttlSec` / `.maxAttempts` | 600 / 5 | a resend inside the first code's lifetime keeps the attempts already used |
 | `emailCode.digits` | 6 | 6 or 8 |
 | `emailCode.maxFailuresPerEmail` / `.failureWindowSec` | 10 / 86,400 | failures per address across all its codes, per fixed window — see the trade-off below |

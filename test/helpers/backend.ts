@@ -32,16 +32,29 @@ function sql() {
   return neonClient;
 }
 
+/** Raw driver access for test plumbing (DDL has no row count, so it bypasses the adapter). */
+export async function rawSql(text: string): Promise<void> {
+  await sql().query(text, []);
+}
+
+/** A result with a numeric rowCount, or an error — never a null passed through as "0 rows". */
+function counted(r: { rows: Record<string, unknown>[]; rowCount: number | null }): PgQueryResult<any> {
+  if (typeof r.rowCount !== 'number') throw new Error('neon: no row count in the result');
+  return { rows: r.rows, rowCount: r.rowCount };
+}
+
 /** The README's Neon HTTP adapter, verbatim apart from the local endpoint. */
 export function neonExecutor(): PgExecutor {
   const s = sql();
   return {
-    query: (text, params) => s.query(text, [...params]) as unknown as Promise<PgQueryResult<any>>,
-    transaction: (statements) =>
-      s.transaction(
-        statements.map((st) => s.query(st.text, [...st.params])),
-        { isolationLevel: 'ReadCommitted' },
-      ) as unknown as Promise<PgQueryResult[]>,
+    query: async (text, params) => counted(await s.query(text, [...params])),
+    transaction: async (statements) =>
+      (
+        await s.transaction(
+          statements.map((st) => s.query(st.text, [...st.params])),
+          { isolationLevel: 'ReadCommitted' },
+        )
+      ).map(counted),
   };
 }
 
@@ -49,8 +62,48 @@ export function makeSessionStore(options: { clock?: Clock } = {}) {
   return BACKEND === 'pg' ? pgSessionStore(neonExecutor(), options) : d1SessionStore(env.DB, options);
 }
 
-export function makeDeviceStore(options: D1DeviceAuthStoreOptions = {}) {
-  return BACKEND === 'pg' ? pgDeviceAuthStore(neonExecutor(), { clock: options.clock }) : d1DeviceAuthStore(env.DB, options);
+export function makeDeviceStore(options: D1DeviceAuthStoreOptions & { executor?: PgExecutor } = {}) {
+  return BACKEND === 'pg'
+    ? pgDeviceAuthStore(options.executor ?? neonExecutor(), { clock: options.clock })
+    : d1DeviceAuthStore(env.DB, options);
+}
+
+/** An executor whose driver reports no row counts — what a careless adapter might return. */
+export function nullRowCount(executor: PgExecutor): PgExecutor {
+  const strip = (r: PgQueryResult) => ({ ...r, rowCount: null as unknown as number });
+  return {
+    query: async (text, params) => strip(await executor.query(text, params)) as never,
+    transaction: async (statements) => (await executor.transaction(statements)).map(strip),
+  };
+}
+
+/**
+ * Makes every UPDATE that revokes a trusted device fail inside the database —
+ * the statement errors, so whatever transaction or batch it is part of rolls
+ * back. Returns the function that removes it again.
+ */
+export async function failDeviceRevocation(): Promise<() => Promise<void>> {
+  if (BACKEND === 'pg') {
+    await sql().query(
+      `CREATE OR REPLACE FUNCTION wa_test_fail_revoke() RETURNS trigger LANGUAGE plpgsql AS
+       $$ BEGIN RAISE EXCEPTION 'injected: device revocation fails'; END $$`,
+    );
+    await sql().query(
+      `CREATE TRIGGER wa_test_fail_revoke BEFORE UPDATE ON auth_trusted_devices FOR EACH ROW
+       WHEN (NEW.revoked_at IS NOT NULL AND OLD.revoked_at IS NULL) EXECUTE FUNCTION wa_test_fail_revoke()`,
+    );
+    return async () => {
+      await sql().query('DROP TRIGGER IF EXISTS wa_test_fail_revoke ON auth_trusted_devices');
+    };
+  }
+  await env.DB.prepare(
+    `CREATE TRIGGER wa_test_fail_revoke BEFORE UPDATE OF revoked_at ON auth_trusted_devices
+     WHEN NEW.revoked_at IS NOT NULL AND OLD.revoked_at IS NULL
+     BEGIN SELECT RAISE(ABORT, 'injected: device revocation fails'); END`,
+  ).run();
+  return async () => {
+    await env.DB.prepare('DROP TRIGGER IF EXISTS wa_test_fail_revoke').run();
+  };
 }
 
 // ---------------------------------------------------------------------------

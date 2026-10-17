@@ -371,6 +371,22 @@ table names are fixed.
 The guarantees above hold on Postgres under these conditions, which are the
 app's to meet (README → Postgres stores):
 
+- **Autocommit, and a connection of its own per request.** Failure slots are
+  reserved before a PIN or code is checked and must stay reserved, so each
+  `query()` must commit on its own. Inside a transaction the app opened, a
+  rollback would hand the reserved guesses back and the PIN/code limits would
+  not hold; a `pg` Client shared across requests can put one request's
+  statements into another's transaction. A runtime check was considered and
+  left out: `now() = statement_timestamp()` reads as "autocommit" for the first
+  statement of a transaction sent in the same message as its `BEGIN`
+  (measured: `BEGIN; SELECT now() = statement_timestamp()` returns true), so it
+  cannot detect the case reliably.
+- **`rowCount` is a number.** Outcomes that matter (was a PIN replaced, which
+  devices were revoked) come from `RETURNING` rows; a count the stores still
+  read must be a finite number or they throw. An adapter that turned a
+  driver's `null` into `0` once made a PIN change skip revoking the other
+  devices (review F1).
+
 - **Fresh reads.** The executor must reach the primary with no query cache:
   Hyperdrive only with `--caching-disabled`, no read replica. A cached or
   lagging `SELECT` keeps a revoked session or device alive and lets a rate
@@ -381,6 +397,15 @@ app's to meet (README → Postgres stores):
   (PostgreSQL docs, 13.2.1). Tested deterministically for all seven
   conditional statements by holding a row lock on one connection and running
   the statement on another (`test/pg-node/locks.test.ts`).
+- **PIN change is one transaction** (D1: one batch) on both backends: the new
+  PIN, the cleared login guard and — with `revokeOtherDevicesOnChange` — the
+  other devices' revocation commit together or not at all (review F3; before,
+  a failure after the PIN write left the new PIN live and the other devices
+  trusted). Ending the account's sessions follows as a separate step, because
+  a KV session store cannot join a transaction; if it fails, the other
+  devices' sessions are refused anyway, since their devices are revoked
+  (deviceBoundSessionStore). Sessions with no device survive such a failure
+  until they expire or the next revoke-all.
 - **What D1's single writer gave for free** is made explicit: PIN replacement
   serialises per account with `pg_advisory_xact_lock` (without it, two
   concurrent changes fail with a unique violation — reproduced in

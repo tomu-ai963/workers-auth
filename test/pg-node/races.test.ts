@@ -59,7 +59,7 @@ describe('replaceCredential: two concurrent PIN changes', () => {
 
   it('with the advisory lock, the second waits for the first and both succeed: last writer wins', async () => {
     const replaced = await interleave(c, replacement(pin('pA', NOW + 1), true), () => store.replaceCredential(pin('pB', NOW + 2)));
-    expect(replaced).toBe(true); // B revoked A's PIN, which it could see once A had committed
+    expect(replaced.replaced).toBe(true); // B revoked A's PIN, which it could see once A had committed
     expect(await live()).toEqual(['pB']);
   });
 
@@ -79,7 +79,7 @@ describe('replaceCredential: two concurrent PIN changes', () => {
 describe('replaceCredential: two concurrent first PINs (nothing to revoke)', () => {
   it('with the lock, the second waits, then revokes the first PIN and both succeed', async () => {
     const replaced = await interleave(c, replacement(pin('pA', NOW + 1), true), () => store.replaceCredential(pin('pB', NOW + 2)));
-    expect(replaced).toBe(true);
+    expect(replaced.replaced).toBe(true);
     expect(await live()).toEqual(['pB']);
   });
 
@@ -112,9 +112,10 @@ describe('resetLoginGuard: the state it reports is the state it clears', () => {
     const seen: string[] = [];
     const counting = pgDeviceAuthStore(
       {
-        query: (text, params) => {
+        query: async (text, params) => {
           seen.push(text);
-          return c.b.query(text, [...params]);
+          const r = await c.b.query(text, [...params]);
+          return { rows: r.rows, rowCount: r.rowCount ?? 0 };
         },
         transaction: () => {
           throw new Error('resetLoginGuard must not need a transaction');

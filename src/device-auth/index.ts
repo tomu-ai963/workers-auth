@@ -185,7 +185,9 @@ export type DeviceAuthOptions = {
     /**
      * When an existing PIN is replaced, revoke the account's other trusted
      * devices *and every session of the account* — including the one making
-     * the change, which then logs in again with the new PIN. Default: false.
+     * the change, which then logs in again with the new PIN. The new PIN and
+     * the devices' revocation are one store transaction: both or neither.
+     * Default: false.
      */
     revokeOtherDevicesOnChange?: boolean;
   };
@@ -986,25 +988,38 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
       }
 
       const material = await pin.enroll(value, { keys: await keys() });
-      const replaced = await store.replaceCredential({
-        credentialId: toHex(randomBytes(16)),
-        accountId: session.userId,
-        type: 'pin',
-        deviceId: null,
-        material,
-        createdAt: now,
-        updatedAt: now,
-        lastUsedAt: null,
-      });
-      await store.resetLoginGuard(session.userId, now);
+      // One transaction (D1: one batch): the new PIN, a cleared failure
+      // counter and — when the PIN replaces one — the other devices' revocation
+      // happen together or not at all. A failure part-way can no longer leave
+      // the new PIN live while the other devices stay trusted.
+      const { replaced, devicesRevoked } = await store.replaceCredential(
+        {
+          credentialId: toHex(randomBytes(16)),
+          accountId: session.userId,
+          type: 'pin',
+          deviceId: null,
+          material,
+          createdAt: now,
+          updatedAt: now,
+          lastUsedAt: null,
+        },
+        {
+          resetLoginGuard: true,
+          ...(revokeOthersOnChange ? { revokeOtherDevices: { exceptDeviceId: sessionBoundDeviceId(session) } } : {}),
+        },
+      );
       onEvent({ type: 'pin.set', userId: session.userId, replaced });
 
       if (replaced && revokeOthersOnChange) {
-        const count = await store.revokeAllDevices(session.userId, now, sessionBoundDeviceId(session));
-        if (count > 0) onEvent({ type: 'device.revoked', userId: session.userId, count, reason: 'pin_changed' });
-        // Including this session: the device that is kept still logs in again
-        // with the new PIN, and a session without a device (trustDevice: false)
-        // has no other way to be reached.
+        if (devicesRevoked > 0) {
+          onEvent({ type: 'device.revoked', userId: session.userId, count: devicesRevoked, reason: 'pin_changed' });
+        }
+        // Then every session, this one included: the device that is kept logs
+        // in again with the new PIN, and a session without a device
+        // (trustDevice: false) has no other way to be reached. A separate step
+        // — a KV session store cannot join the transaction — but if it fails,
+        // the other devices' sessions are already dead with their devices
+        // (deviceBoundSessionStore).
         await revokeAllSessions(c, session.userId, 'pin_changed');
         return c.json({ ok: true as const, signedOut: true });
       }

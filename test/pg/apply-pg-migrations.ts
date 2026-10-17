@@ -2,9 +2,8 @@
 // Fails — rather than skips — when Postgres is not configured or not reachable.
 import { env } from 'cloudflare:test';
 
-import { neonExecutor } from '../helpers/backend.js';
+import { rawSql } from '../helpers/backend.js';
 
-const executor = neonExecutor();
 for (const migration of env.PG_MIGRATIONS) {
   const statements = migration.sql
     .split(/\r?\n/)
@@ -13,5 +12,5 @@ for (const migration of env.PG_MIGRATIONS) {
     .split(';')
     .map((s) => s.trim())
     .filter(Boolean);
-  for (const statement of statements) await executor.query(statement, []);
+  for (const statement of statements) await rawSql(statement);
 }
