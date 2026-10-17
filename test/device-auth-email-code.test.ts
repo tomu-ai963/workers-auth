@@ -1,9 +1,9 @@
-import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { generateEmailCode } from '../src/device-auth/index.js';
 import { resetStorage } from './helpers/reset.js';
 import { HEAVY_TIMEOUT, call, client, loginByEmail, MIN, SEC, setup, T0, time } from './helpers/device.js';
+import { db } from './helpers/backend.js';
 
 beforeEach(async () => {
   time.now = T0;
@@ -39,7 +39,7 @@ describe('POST /email/start', { timeout: HEAVY_TIMEOUT }, () => {
     const h = setup();
     await call(h, client(), 'POST', '/auth/device/email/start', { email: EMAIL });
     const code = h.lastCode(EMAIL);
-    const rows = (await env.DB.prepare('SELECT * FROM auth_email_codes').all()).results;
+    const rows = (await db.prepare('SELECT * FROM auth_email_codes').all()).results;
     expect(rows).toHaveLength(1);
     const row = rows[0] as Record<string, unknown>;
     expect(JSON.stringify(row)).not.toContain(code);
@@ -149,7 +149,7 @@ describe('POST /email/verify', { timeout: HEAVY_TIMEOUT }, () => {
     const res = await call(h, client(), 'POST', '/auth/device/email/verify', { email: EMAIL, code });
     expect(res.status).toBe(401);
     // The exhausted row is kept (not deleted) so a resend cannot reset its budget.
-    expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
+    expect(await db.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
   });
 
   it('counts concurrent wrong guesses: 10 in parallel exhaust the code, and only checked ones cost budget', async () => {
@@ -161,11 +161,11 @@ describe('POST /email/verify', { timeout: HEAVY_TIMEOUT }, () => {
       Array.from({ length: 10 }, () => call(h, client(), 'POST', '/auth/device/email/verify', { email: EMAIL, code: wrong })),
     );
     expect(results.every((r) => r.status === 401)).toBe(true);
-    expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
+    expect(await db.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
     // Five were checked and failed; the other five found no attempt left and
     // gave their reservation back. The correct code is still refused: the
     // code's attempts are spent.
-    expect(await env.DB.prepare("SELECT count FROM auth_rate_limits WHERE bucket LIKE 'otp-fail:%'").first('count')).toBe(5);
+    expect(await db.prepare("SELECT count FROM auth_rate_limits WHERE bucket LIKE 'otp-fail:%'").first('count')).toBe(5);
     const res = await call(h, client(), 'POST', '/auth/device/email/verify', { email: EMAIL, code });
     expect(res.status).toBe(401);
     expect(res.body).toEqual({ error: 'invalid_code' });

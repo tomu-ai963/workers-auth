@@ -1,24 +1,14 @@
 import { env } from 'cloudflare:test';
 
-const TABLES = [
-  'auth_sessions',
-  'auth_revocations',
-  'auth_user_revocations',
-  'auth_magic_link_tokens',
-  'auth_api_keys',
-  'auth_email_codes',
-  'auth_trusted_devices',
-  'auth_credentials',
-  'auth_login_guards',
-  'auth_rate_limits',
-];
+import { resetDatabase } from './backend.js';
 
 /**
  * Storage is shared across tests in this pool, so every test that asserts on
- * counts starts from a clean slate explicitly.
+ * counts starts from a clean slate explicitly — on whichever backend the
+ * project runs (D1, or Postgres too).
  */
 export async function resetStorage(): Promise<void> {
-  await env.DB.batch(TABLES.map((table) => env.DB.prepare(`DELETE FROM ${table}`)));
+  await resetDatabase();
 
   let cursor: string | undefined;
   do {

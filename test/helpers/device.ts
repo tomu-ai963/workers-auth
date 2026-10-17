@@ -3,15 +3,14 @@ import { Hono } from 'hono';
 
 import { randomToken } from '../../src/crypto.js';
 import {
-  d1DeviceAuthStore,
   deviceAuth,
   deviceBoundSessionStore,
   type DeviceAuthOptions,
 } from '../../src/device-auth/index.js';
 import { createAuth, getUser, type AuthEvent, type CreateAuthOptions } from '../../src/index.js';
 import { sessionBearer } from '../../src/providers/session-bearer.js';
-import { d1SessionStore } from '../../src/store/d1.js';
 import { cookieHeader, readCookieJar, type CookieJar } from '../../src/testing.js';
+import { BACKEND, makeDeviceStore, makeSessionStore } from './backend.js';
 
 export const ORIGIN = 'https://app.example.com';
 export const T0 = 1_700_000_000_000;
@@ -24,9 +23,10 @@ export const DAY = 24 * HOUR;
  * Per-test timeout for the request-heavy flows (enrolment, PIN hashing, many
  * start/verify round trips). Under a full parallel run on a slow machine these
  * can pass the 5 s default; the global testTimeout is left alone so that a
- * light test that hangs still fails fast.
+ * light test that hangs still fails fast. On Postgres every query is an HTTP
+ * round trip through the local Neon proxy, hence the larger budget there.
  */
-export const HEAVY_TIMEOUT = 30_000;
+export const HEAVY_TIMEOUT = BACKEND === 'pg' ? 300_000 : 30_000;
 
 export const time = { now: T0 };
 export const clock = () => time.now;
@@ -43,8 +43,8 @@ export function setup(
 ) {
   const events: AuthEvent[] = [];
   const sent: Array<{ email: string; code: string }> = [];
-  const store = d1DeviceAuthStore(env.DB, { clock });
-  const sessionStore = deviceBoundSessionStore(d1SessionStore(env.DB, { clock }), store, { clock });
+  const store = makeDeviceStore({ clock });
+  const sessionStore = deviceBoundSessionStore(makeSessionStore({ clock }), store, { clock });
   const auth =
     overrides.auth ??
     createAuth({

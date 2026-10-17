@@ -58,6 +58,10 @@
       "types": "./dist/store/d1.d.ts",
       "import": "./dist/store/d1.js"
     },
+    "./store/pg": {
+      "types": "./dist/store/pg.d.ts",
+      "import": "./dist/store/pg.js"
+    },
     "./client": {
       "types": "./dist/client.d.ts",
       "import": "./dist/client.js"
@@ -72,7 +76,11 @@
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:d1": "vitest run --project d1",
+    "test:pg": "vitest run --project pg --project pg-node",
+    "test:watch": "vitest",
+    "pg:up": "node scripts/pg-test.mjs up",
+    "pg:down": "node scripts/pg-test.mjs down"
   },
   "peerDependencies": {
     "hono": ">=4.0.0"
@@ -80,7 +88,10 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.21.3",
     "@cloudflare/workers-types": "^4.20250109.0",
+    "@neondatabase/serverless": "1.2.0",
+    "@types/pg": "^8.23.1",
     "hono": "^4.6.0",
+    "pg": "8.23.1",
     "tsup": "^8.3.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0"

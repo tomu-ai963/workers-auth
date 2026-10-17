@@ -8,7 +8,6 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { randomToken } from '../src/crypto.js';
 import { isWeakPin } from '../src/device-auth/credentials.js';
 import {
-  d1DeviceAuthStore,
   deviceAuth,
   deviceBoundSessionStore,
   estimateEntropyBits,
@@ -17,7 +16,6 @@ import {
 } from '../src/device-auth/index.js';
 import { createAuth } from '../src/index.js';
 import { sessionBearer } from '../src/providers/session-bearer.js';
-import { d1SessionStore } from '../src/store/d1.js';
 import { kvSessionStore } from '../src/store/kv.js';
 import { extractEmailCodeFromEmail } from '../src/testing.js';
 import { resetStorage } from './helpers/reset.js';
@@ -38,6 +36,7 @@ import {
   time,
   wrongCode,
 } from './helpers/device.js';
+import { db, makeDeviceStore, makeSessionStore } from './helpers/backend.js';
 
 beforeEach(async () => {
   time.now = T0;
@@ -121,7 +120,7 @@ describe('P0-1 (a): failures per address across codes', { timeout: HEAVY_TIMEOUT
     );
     expect(results.filter((r) => r.status === 401)).toHaveLength(10);
     expect(results.filter((r) => r.status === 429)).toHaveLength(5);
-    expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(10);
+    expect(await db.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(10);
   });
 });
 
@@ -135,12 +134,12 @@ describe('P0-1 (b): a resend keeps used attempts while the window lasts', { time
     }
     time.now += 9 * MIN; // still inside the first code's 10 minutes
     await call(h, client(), 'POST', '/auth/device/email/start', { email });
-    expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
+    expect(await db.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(5);
     expect((await call(h, client(), 'POST', '/auth/device/email/verify', { email, code: h.lastCode(email) })).status).toBe(401);
 
     time.now += 2 * MIN; // past T0 + 10 min
     await call(h, client(), 'POST', '/auth/device/email/start', { email });
-    expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(0);
+    expect(await db.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(0);
     expect((await call(h, client(), 'POST', '/auth/device/email/verify', { email, code: h.lastCode(email) })).status).toBe(200);
   });
 
@@ -148,12 +147,12 @@ describe('P0-1 (b): a resend keeps used attempts while the window lasts', { time
     const h = setup();
     const email = 'chain@example.com';
     await call(h, client(), 'POST', '/auth/device/email/start', { email });
-    const first = await env.DB.prepare('SELECT attempts_reset_at FROM auth_email_codes').first('attempts_reset_at');
+    const first = await db.prepare('SELECT attempts_reset_at FROM auth_email_codes').first('attempts_reset_at');
     for (let i = 0; i < 3; i++) {
       time.now += 2 * MIN;
       await call(h, client(), 'POST', '/auth/device/email/start', { email });
     }
-    expect(await env.DB.prepare('SELECT attempts_reset_at FROM auth_email_codes').first('attempts_reset_at')).toBe(first);
+    expect(await db.prepare('SELECT attempts_reset_at FROM auth_email_codes').first('attempts_reset_at')).toBe(first);
   });
 });
 
@@ -201,11 +200,11 @@ describe('P0-2: device-bound sessions', { timeout: HEAVY_TIMEOUT }, () => {
     const thief = client({ deviceToken: owner.deviceToken });
     await pinLogin(h, thief, PIN);
     const id = (owner.deviceToken as string).split('.')[0];
-    const before = Number(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_sessions').first('n'));
+    const before = Number(await db.prepare('SELECT COUNT(*) AS n FROM auth_sessions').first('n'));
     await call(h, owner, 'POST', `/auth/device/devices/${id}/revoke`);
     expect((await call(h, thief, 'GET', '/api/me')).status).toBe(401);
     expect((await call(h, owner, 'GET', '/api/me')).status).toBe(401); // owner's session was on that device too
-    expect(Number(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_sessions').first('n'))).toBe(before - 2);
+    expect(Number(await db.prepare('SELECT COUNT(*) AS n FROM auth_sessions').first('n'))).toBe(before - 2);
   });
 
   it('an expired device ends its sessions too', async () => {
@@ -269,15 +268,15 @@ describe('P0-2: device-bound sessions', { timeout: HEAVY_TIMEOUT }, () => {
   });
 
   it('refuses an Auth whose store is not device-bound', () => {
-    const plain = d1SessionStore(env.DB);
+    const plain = makeSessionStore();
     const auth = createAuth({ providers: [], store: plain });
     expect(() =>
-      deviceAuth({ auth, store: d1DeviceAuthStore(env.DB), secret: randomToken(), transport: 'cookie', sendCode: async () => {} }),
+      deviceAuth({ auth, store: makeDeviceStore(), secret: randomToken(), transport: 'cookie', sendCode: async () => {} }),
     ).toThrow(/deviceBoundSessionStore/);
   });
 
   it('refuses a store that cannot revokeAllForUser', () => {
-    const devices = d1DeviceAuthStore(env.DB);
+    const devices = makeDeviceStore();
     const store = deviceBoundSessionStore(kvSessionStore(env.KV, { allowUnrevocableSessions: true }), devices);
     const auth = createAuth({ providers: [], store });
     expect(() => deviceAuth({ auth, store: devices, secret: randomToken(), transport: 'cookie', sendCode: async () => {} })).toThrow(
@@ -286,8 +285,8 @@ describe('P0-2: device-bound sessions', { timeout: HEAVY_TIMEOUT }, () => {
   });
 
   it('refuses a sessionBearer provider reading an unwrapped store', () => {
-    const devices = d1DeviceAuthStore(env.DB);
-    const plain = d1SessionStore(env.DB);
+    const devices = makeDeviceStore();
+    const plain = makeSessionStore();
     const auth = createAuth({ providers: [sessionBearer({ store: plain })], store: deviceBoundSessionStore(plain, devices) });
     expect(() => deviceAuth({ auth, store: devices, secret: randomToken(), transport: 'response', sendCode: async () => {} })).toThrow(
       /session-bearer/,
@@ -295,8 +294,8 @@ describe('P0-2: device-bound sessions', { timeout: HEAVY_TIMEOUT }, () => {
   });
 
   it('the wrapper keeps the inner store’s other methods and does not double-wrap', async () => {
-    const devices = d1DeviceAuthStore(env.DB);
-    const inner = d1SessionStore(env.DB);
+    const devices = makeDeviceStore();
+    const inner = makeSessionStore();
     const wrapped = deviceBoundSessionStore(inner, devices);
     expect(typeof wrapped.cleanup).toBe('function');
     expect(await wrapped.cleanup()).toBe(0);
@@ -398,7 +397,7 @@ describe('P1 (c): bot check hook', { timeout: HEAVY_TIMEOUT }, () => {
     expect(res.body).toEqual({ error: 'bot_check_failed' });
     expect(h.sent).toHaveLength(0);
     expect(seen).toEqual(['email_start']);
-    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_rate_limits').first('n')).toBe(0);
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM auth_rate_limits').first('n')).toBe(0);
   });
 
   it('admits when the hook says yes', async () => {
@@ -420,7 +419,7 @@ describe('P1 (c): bot check hook', { timeout: HEAVY_TIMEOUT }, () => {
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: 'bot_check_failed' });
     expect(calls).toBe(3); // email_start + email_verify while enrolling, then pin_login
-    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_login_guards').first('n')).toBe(0);
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM auth_login_guards').first('n')).toBe(0);
   });
 });
 

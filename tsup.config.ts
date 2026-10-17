@@ -10,6 +10,7 @@ export default defineConfig({
     'device-auth': 'src/device-auth/index.ts',
     'store/kv': 'src/store/kv.ts',
     'store/d1': 'src/store/d1.ts',
+    'store/pg': 'src/store/pg/index.ts',
     client: 'src/client.ts',
     testing: 'src/testing.ts',
   },
