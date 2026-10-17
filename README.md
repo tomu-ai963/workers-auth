@@ -22,6 +22,12 @@ npm install @tomu-ai/workers-auth hono
 # or: pnpm add @tomu-ai/workers-auth hono
 ```
 
+Not on the npm registry yet: install from a Git tag
+(`npm install github:tomu-ai963/workers-auth#v0.3.1 hono`). `dist/` is not
+committed; the `prepare` script builds it during a Git install. Tags before
+`v0.3.1` have no `prepare` script and install without `dist/`, so their
+imports fail.
+
 Subpaths are split so a project that only wants sessions does not pull in JWKS
 verification or D1 code:
 
