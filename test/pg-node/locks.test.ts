@@ -10,111 +10,38 @@
  * the version it saw when it started. That re-evaluation is what makes "check
  * the limit and move the counter" one decision under READ COMMITTED.
  *
- * Runs in its own database (workers_auth_locks) so it never shares rows with
- * the workerd "pg" project. Fails, rather than skips, without `pnpm pg:up`.
+ * Connections and the interleaving itself: ./harness.ts.
  */
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
-import { pgDeviceAuthStore, type PgExecutor } from '../../src/store/pg/index.js';
+import { pgDeviceAuthStore } from '../../src/store/pg/index.js';
+import { clientExecutor, connect, DAY, disconnect, interleave as run2, NOW, type Connections } from './harness.js';
 
-const NOW = 1_700_000_000_000;
-const DAY = 86_400_000;
-const LOCK_DB = 'workers_auth_locks';
-
-function url(database: string): string {
-  const base = process.env['WA_TEST_PG_URL'];
-  if (!base) throw new Error('Postgres is not configured: run `pnpm pg:up` (test/pg/.env is missing)');
-  const u = new URL(base);
-  u.pathname = `/${database}`;
-  return u.toString();
-}
-
-/** The README's adapter for a `pg` Client (Hyperdrive), verbatim. */
-function clientExecutor(client: pg.Client): PgExecutor {
-  return {
-    query: (text, params) => client.query(text, [...params]),
-    async transaction(statements) {
-      await client.query('BEGIN');
-      try {
-        const results = [];
-        for (const s of statements) results.push(await client.query(s.text, [...s.params]));
-        await client.query('COMMIT');
-        return results;
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw error;
-      }
-    },
-  };
-}
-
-let a: pg.Client; // holds the lock
-let b: pg.Client; // runs the store
-let monitor: pg.Client;
-let bPid: number;
+let c: Connections;
 let store: ReturnType<typeof pgDeviceAuthStore>;
 
 beforeAll(async () => {
-  const admin = new pg.Client({ connectionString: url('workers_auth_test') });
-  await admin.connect();
-  const exists = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [LOCK_DB]);
-  if (exists.rowCount === 0) await admin.query(`CREATE DATABASE ${LOCK_DB}`);
-  await admin.end();
-
-  [a, b, monitor] = [0, 1, 2].map(() => new pg.Client({ connectionString: url(LOCK_DB) })) as [pg.Client, pg.Client, pg.Client];
-  await Promise.all([a.connect(), b.connect(), monitor.connect()]);
-  const dir = join(process.cwd(), 'migrations', 'pg');
-  for (const name of readdirSync(dir).filter((n) => n.endsWith('.sql')).sort()) {
-    await monitor.query(readFileSync(join(dir, name), 'utf8'));
-  }
-  bPid = (await b.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]!.pid;
-  store = pgDeviceAuthStore(clientExecutor(b), { clock: () => NOW });
+  c = await connect();
+  store = pgDeviceAuthStore(clientExecutor(c.b), { clock: () => NOW });
 });
 
 afterAll(async () => {
-  await Promise.all([a?.end(), b?.end(), monitor?.end()]);
+  await disconnect(c);
 });
 
 beforeEach(async () => {
-  await monitor.query('TRUNCATE auth_rate_limits, auth_login_guards, auth_email_codes, auth_trusted_devices');
+  await c.monitor.query('TRUNCATE auth_rate_limits, auth_login_guards, auth_email_codes, auth_trusted_devices');
 });
 
-/** Resolves once B is waiting on a lock — so the interleaving is real, not hoped for. */
-async function blockedOnLock(): Promise<void> {
-  for (let i = 0; i < 200; i++) {
-    const r = await monitor.query<{ wait_event_type: string | null }>(
-      'SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1',
-      [bPid],
-    );
-    if (r.rows[0]?.wait_event_type === 'Lock') return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error('B never blocked on the row lock');
-}
+/** A changes exactly one row inside an open transaction; B runs; A commits. */
+const interleave = <T>(change: string, params: unknown[], run: () => Promise<T>) =>
+  run2(c, [{ text: change, params, rowCount: 1 }], run);
 
-/** A changes the row inside an open transaction; B runs; A commits; B's answer is returned. */
-async function interleave<T>(change: string, params: unknown[], run: () => Promise<T>): Promise<T> {
-  await a.query('BEGIN');
-  const result = await a.query(change, params);
-  expect(result.rowCount).toBe(1); // A really holds that row
-  const pending = run();
-  try {
-    await blockedOnLock();
-  } finally {
-    await a.query('COMMIT');
-  }
-  return pending;
-}
-
-const one = async (sql: string, params: unknown[] = []) => (await monitor.query(sql, params)).rows[0] as Record<string, unknown>;
+const one = async (sql: string, params: unknown[] = []) => (await c.monitor.query(sql, params)).rows[0] as Record<string, unknown>;
 
 describe('reserveRateLimit', () => {
   beforeEach(async () => {
-    await monitor.query(`INSERT INTO auth_rate_limits (bucket, window_start, count) VALUES ('b', $1, 9)`, [NOW]);
+    await c.monitor.query(`INSERT INTO auth_rate_limits (bucket, window_start, count) VALUES ('b', $1, 9)`, [NOW]);
   });
 
   it('A fills the last slot: B, waiting at 9 of 10, is refused and the count stays 10', async () => {
@@ -144,7 +71,7 @@ describe('reserveRateLimit', () => {
 
 describe('reserveLoginAttempt', () => {
   it('A reaches max: B, waiting at 2 of 3, is refused', async () => {
-    await monitor.query(`INSERT INTO auth_login_guards (account_id, failed_count, locked_at, updated_at) VALUES ('acct', 2, NULL, 0)`);
+    await c.monitor.query(`INSERT INTO auth_login_guards (account_id, failed_count, locked_at, updated_at) VALUES ('acct', 2, NULL, 0)`);
     const r = await interleave(`UPDATE auth_login_guards SET failed_count = 3 WHERE account_id = 'acct'`, [], () =>
       store.reserveLoginAttempt('acct', 3, NOW),
     );
@@ -153,7 +80,7 @@ describe('reserveLoginAttempt', () => {
   });
 
   it('A locks the account below max: B is refused', async () => {
-    await monitor.query(`INSERT INTO auth_login_guards (account_id, failed_count, locked_at, updated_at) VALUES ('acct', 0, NULL, 0)`);
+    await c.monitor.query(`INSERT INTO auth_login_guards (account_id, failed_count, locked_at, updated_at) VALUES ('acct', 0, NULL, 0)`);
     const r = await interleave(`UPDATE auth_login_guards SET locked_at = $1 WHERE account_id = 'acct'`, [NOW], () =>
       store.reserveLoginAttempt('acct', 3, NOW),
     );
@@ -161,7 +88,7 @@ describe('reserveLoginAttempt', () => {
   });
 
   it('A resets the guard: B counts from 0', async () => {
-    await monitor.query(`INSERT INTO auth_login_guards (account_id, failed_count, locked_at, updated_at) VALUES ('acct', 2, NULL, 0)`);
+    await c.monitor.query(`INSERT INTO auth_login_guards (account_id, failed_count, locked_at, updated_at) VALUES ('acct', 2, NULL, 0)`);
     const r = await interleave(`UPDATE auth_login_guards SET failed_count = 0 WHERE account_id = 'acct'`, [], () =>
       store.reserveLoginAttempt('acct', 3, NOW),
     );
@@ -171,7 +98,7 @@ describe('reserveLoginAttempt', () => {
 
 describe('reserveEmailCodeAttempt', () => {
   beforeEach(async () => {
-    await monitor.query(
+    await c.monitor.query(
       `INSERT INTO auth_email_codes (email, code_hash, key_id, attempts, attempts_reset_at, expires_at, created_at)
        VALUES ('e@example.com', 'h1', 'k', 4, $1, $1, $2)`,
       [NOW + 600_000, NOW],
@@ -203,7 +130,7 @@ describe('reserveEmailCodeAttempt', () => {
 
 describe('refundRateLimit', () => {
   beforeEach(async () => {
-    await monitor.query(`INSERT INTO auth_rate_limits (bucket, window_start, count) VALUES ('b', $1, 1)`, [NOW]);
+    await c.monitor.query(`INSERT INTO auth_rate_limits (bucket, window_start, count) VALUES ('b', $1, 1)`, [NOW]);
   });
 
   it('A brings the count to 0: B’s refund does nothing (no -1)', async () => {
@@ -221,7 +148,7 @@ describe('refundRateLimit', () => {
 
 describe('consumeEmailCode', () => {
   beforeEach(async () => {
-    await monitor.query(
+    await c.monitor.query(
       `INSERT INTO auth_email_codes (email, code_hash, key_id, attempts, attempts_reset_at, expires_at, created_at)
        VALUES ('e@example.com', 'h1', 'k', 1, $1, $1, $2)`,
       [NOW + 600_000, NOW],
@@ -244,7 +171,7 @@ describe('consumeEmailCode', () => {
 
 describe('touchDevice', () => {
   beforeEach(async () => {
-    await monitor.query(
+    await c.monitor.query(
       `INSERT INTO auth_trusted_devices
          (device_id, account_id, email, secret_hash, label, created_at, last_used_at, idle_expires_at, absolute_expires_at, revoked_at)
        VALUES ('d1', 'acct', 'e@example.com', 'h', NULL, $1, $1, $2, $3, NULL)`,
@@ -273,7 +200,7 @@ describe('touchDevice', () => {
 
 describe('lockAccount', () => {
   beforeEach(async () => {
-    await monitor.query(`INSERT INTO auth_login_guards (account_id, failed_count, locked_at, updated_at) VALUES ('acct', 3, NULL, 0)`);
+    await c.monitor.query(`INSERT INTO auth_login_guards (account_id, failed_count, locked_at, updated_at) VALUES ('acct', 3, NULL, 0)`);
   });
 
   it('A resets the guard (a correct email code): B’s lock no longer applies', async () => {

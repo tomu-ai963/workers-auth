@@ -11,7 +11,7 @@
 
 import { randomToken, sha256Hex } from '../../crypto.js';
 import type { Clock, NewSession, Session, SessionStore, SubjectType } from '../../types.js';
-import { affected, assertExecutor, num, type PgExecutor } from './executor.js';
+import { affected, assertExecutor, num, retrying, type PgExecutor } from './executor.js';
 
 export type PgSessionStoreOptions = {
   clock?: Clock;
@@ -61,6 +61,7 @@ function rowToSession(row: Row, sid: string): Session {
 
 export function pgSessionStore(executor: PgExecutor, options: PgSessionStoreOptions = {}): PgSessionStore {
   assertExecutor(executor, 'pgSessionStore');
+  const db = retrying(executor);
   const table = 'public.auth_sessions';
   const now: Clock = options.clock ?? Date.now;
 
@@ -81,7 +82,7 @@ export function pgSessionStore(executor: PgExecutor, options: PgSessionStoreOpti
       const absoluteExpiresAt = at + input.absoluteTtlSec * 1000;
       const idleExpiresAt = Math.min(at + input.idleTtlSec * 1000, absoluteExpiresAt);
 
-      await executor.query(
+      await db.query(
         `INSERT INTO ${table}
            (sid_hash, user_id, subject_type, created_at, last_seen_at, idle_expires_at, absolute_expires_at, scope, meta)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
@@ -113,12 +114,12 @@ export function pgSessionStore(executor: PgExecutor, options: PgSessionStoreOpti
 
     async get(sid: string): Promise<Session | null> {
       const sidHash = await sha256Hex(sid);
-      const { rows } = await executor.query<Row>(`SELECT * FROM ${table} WHERE sid_hash = $1`, [sidHash]);
+      const { rows } = await db.query<Row>(`SELECT * FROM ${table} WHERE sid_hash = $1`, [sidHash]);
       const row = rows[0];
       if (!row) return null;
       const at = now();
       if (at >= num(row.idle_expires_at) || at >= num(row.absolute_expires_at)) {
-        await executor.query(`DELETE FROM ${table} WHERE sid_hash = $1`, [sidHash]);
+        await db.query(`DELETE FROM ${table} WHERE sid_hash = $1`, [sidHash]);
         return null;
       }
       return rowToSession(row, sid);
@@ -126,7 +127,7 @@ export function pgSessionStore(executor: PgExecutor, options: PgSessionStoreOpti
 
     async touch(sid: string, idleExpiresAt: number): Promise<void> {
       const sidHash = await sha256Hex(sid);
-      await executor.query(
+      await db.query(
         `UPDATE ${table}
             SET last_seen_at = $2,
                 idle_expires_at = LEAST($3::bigint, absolute_expires_at)
@@ -138,18 +139,18 @@ export function pgSessionStore(executor: PgExecutor, options: PgSessionStoreOpti
     },
 
     async revoke(sid: string): Promise<void> {
-      await executor.query(`DELETE FROM ${table} WHERE sid_hash = $1`, [await sha256Hex(sid)]);
+      await db.query(`DELETE FROM ${table} WHERE sid_hash = $1`, [await sha256Hex(sid)]);
     },
 
     async revokeAllForUser(userId: string): Promise<void> {
-      await executor.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]);
+      await db.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]);
     },
 
     /** Two indexed range deletes rather than one OR (see d1SessionStore). */
     async cleanup(at?: number): Promise<number> {
       const cutoff = at ?? now();
-      const byAbsolute = await executor.query(`DELETE FROM ${table} WHERE absolute_expires_at <= $1`, [cutoff]);
-      const byIdle = await executor.query(`DELETE FROM ${table} WHERE idle_expires_at <= $1`, [cutoff]);
+      const byAbsolute = await db.query(`DELETE FROM ${table} WHERE absolute_expires_at <= $1`, [cutoff]);
+      const byIdle = await db.query(`DELETE FROM ${table} WHERE idle_expires_at <= $1`, [cutoff]);
       return affected(byAbsolute) + affected(byIdle);
     },
   };

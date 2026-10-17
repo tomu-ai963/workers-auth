@@ -59,3 +59,31 @@ export function numOrNull(value: unknown): number | null {
 export function affected(result: PgQueryResult): number {
   return result.rowCount ?? 0;
 }
+
+const RETRYABLE_SQLSTATES = new Set(['40001', '40P01']);
+
+/**
+ * Runs `fn`; on a serialization failure (40001) or a deadlock (40P01) runs it
+ * exactly once more. Postgres reports both only after rolling the whole
+ * transaction back, so nothing of the first attempt took effect and a second
+ * one cannot double-count. Every other error is rethrown untouched — above all
+ * network errors and timeouts, after which the statement may have committed:
+ * running a reservation again there would charge it twice.
+ */
+export async function retryOnce<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (typeof code === 'string' && RETRYABLE_SQLSTATES.has(code)) return fn();
+    throw error;
+  }
+}
+
+/** The executor with every call wrapped in `retryOnce`. */
+export function retrying(executor: PgExecutor): PgExecutor {
+  return {
+    query: (text, params) => retryOnce(() => executor.query(text, params)),
+    transaction: (statements) => retryOnce(() => executor.transaction(statements)),
+  };
+}

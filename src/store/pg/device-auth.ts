@@ -17,6 +17,13 @@
  * test/pg-node/locks.test.ts holds a row lock on one connection and runs each
  * of these statements on another to show the second waits and re-evaluates.
  *
+ * Where D1's single writer made a two-statement batch safe and Postgres does
+ * not, the statement changes shape:
+ *   - replaceCredential serialises per account with a transaction-scoped
+ *     advisory lock (see replaceCredentialStatements);
+ *   - resetLoginGuard is one statement that locks the row before reading it.
+ * Every call is retried once on 40001 / 40P01 only (see retryOnce).
+ *
  * Apply `migrations/pg/0006_device_auth.sql` before use.
  */
 
@@ -29,7 +36,7 @@ import type {
 } from '../../device-auth/store.js';
 import type { CredentialMaterial, CredentialType } from '../../device-auth/credentials.js';
 import type { Clock } from '../../types.js';
-import { affected, assertExecutor, num, numOrNull, type PgExecutor } from './executor.js';
+import { affected, assertExecutor, num, numOrNull, retrying, type PgExecutor, type PgStatement } from './executor.js';
 
 export type PgDeviceAuthStoreOptions = {
   clock?: Clock;
@@ -85,18 +92,54 @@ function parseMaterial(value: string): CredentialMaterial {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Revoke the live credential of the type and insert the new one, in one
+ * transaction, after taking an advisory lock scoped to the account.
+ *
+ * Without the lock, two concurrent replacements race in a way D1 never sees:
+ * the second transaction's UPDATE waits for the first, re-checks the row the
+ * first revoked and skips it — but cannot see the row the first *inserted*
+ * (that row was not in its snapshot), so its own INSERT then violates the
+ * one-live-PIN index (23505) and the PIN change fails. With the lock the
+ * second transaction starts its UPDATE only after the first committed, sees
+ * the new row, revokes it and inserts: last writer wins, as on D1.
+ *
+ * The key is namespaced so it cannot collide with advisory locks the app
+ * takes on the same database. Exported for the race tests only.
+ */
+export function replaceCredentialStatements(table: string, r: CredentialRecord): PgStatement[] {
+  return [
+    {
+      text: `SELECT pg_advisory_xact_lock(hashtextextended('workers-auth:credential:' || $1::text, 0))`,
+      params: [r.accountId],
+    },
+    {
+      text: `UPDATE ${table} SET revoked_at = $3, updated_at = $3
+              WHERE account_id = $1 AND type = $2 AND revoked_at IS NULL`,
+      params: [r.accountId, r.type, r.updatedAt],
+    },
+    {
+      text: `INSERT INTO ${table}
+               (credential_id, account_id, type, device_id, material, created_at, updated_at, last_used_at, revoked_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL)`,
+      params: [r.credentialId, r.accountId, r.type, r.deviceId, JSON.stringify(r.material), r.createdAt, r.updatedAt],
+    },
+  ];
+}
+
 export function pgDeviceAuthStore(
   executor: PgExecutor,
   options: PgDeviceAuthStoreOptions = {},
 ): DeviceAuthStore & DeviceAuthStoreCleanup {
   assertExecutor(executor, 'pgDeviceAuthStore');
+  const db = retrying(executor);
   const codes = 'public.auth_email_codes';
   const devices = 'public.auth_trusted_devices';
   const creds = 'public.auth_credentials';
   const guards = 'public.auth_login_guards';
   const limits = 'public.auth_rate_limits';
   const clock: Clock = options.clock ?? Date.now;
-  const q = executor.query.bind(executor);
+  const q = db.query.bind(db);
 
   return {
     atomic: true,
@@ -303,19 +346,7 @@ export function pgDeviceAuthStore(
     async replaceCredential(r) {
       // One transaction: the partial unique index allows only one live PIN,
       // so the old one has to be revoked before the insert, never after.
-      const [revoked] = await executor.transaction([
-        {
-          text: `UPDATE ${creds} SET revoked_at = $3, updated_at = $3
-                  WHERE account_id = $1 AND type = $2 AND revoked_at IS NULL`,
-          params: [r.accountId, r.type, r.updatedAt],
-        },
-        {
-          text: `INSERT INTO ${creds}
-                   (credential_id, account_id, type, device_id, material, created_at, updated_at, last_used_at, revoked_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL)`,
-          params: [r.credentialId, r.accountId, r.type, r.deviceId, JSON.stringify(r.material), r.createdAt, r.updatedAt],
-        },
-      ]);
+      const [, revoked] = await db.transaction(replaceCredentialStatements(creds, r));
       return (revoked ? affected(revoked) : 0) > 0;
     },
 
@@ -356,15 +387,23 @@ export function pgDeviceAuthStore(
     },
 
     async resetLoginGuard(accountId, now) {
-      const [before] = await executor.transaction([
-        { text: `SELECT failed_count, locked_at FROM ${guards} WHERE account_id = $1`, params: [accountId] },
-        {
-          text: `UPDATE ${guards} SET failed_count = 0, locked_at = NULL, updated_at = $2 WHERE account_id = $1`,
-          params: [accountId, now],
-        },
-      ]);
-      const row = before?.rows[0];
-      return row ? { failedCount: num(row['failed_count']), lockedAt: numOrNull(row['locked_at']) } : null;
+      // One statement. The CTE locks the row (FOR UPDATE) before reading it,
+      // so the state returned is the one the UPDATE actually clears — a
+      // failure or lock committed by a concurrent request is waited for and
+      // reported, not read from an older snapshot. (PostgreSQL 14+; no
+      // RETURNING OLD, which needs 18.)
+      const { rows } = await q<{ failed_count: unknown; locked_at: unknown }>(
+        `WITH before AS (
+           SELECT account_id, failed_count, locked_at FROM ${guards} WHERE account_id = $1 FOR UPDATE
+         )
+         UPDATE ${guards} AS g SET failed_count = 0, locked_at = NULL, updated_at = $2
+           FROM before
+          WHERE g.account_id = before.account_id
+         RETURNING before.failed_count, before.locked_at`,
+        [accountId, now],
+      );
+      const row = rows[0];
+      return row ? { failedCount: num(row.failed_count), lockedAt: numOrNull(row.locked_at) } : null;
     },
 
     async readLoginGuard(accountId) {

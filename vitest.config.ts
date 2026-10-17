@@ -52,6 +52,9 @@ export default defineConfig({
         plugins: [workerd('d1')],
         test: {
           name: 'd1',
+          // Projects run one after another (groupOrder), so the slow Postgres
+          // suites never compete with D1's for CPU and D1 keeps its timings.
+          sequence: { groupOrder: 0 },
           include: ['test/**/*.test.ts'],
           exclude: ['test/pg/**', 'test/pg-node/**'],
           setupFiles: ['./test/apply-migrations.ts'],
@@ -61,6 +64,7 @@ export default defineConfig({
         plugins: [workerd('pg')],
         test: {
           name: 'pg',
+          sequence: { groupOrder: 1 },
           include: [...BOTH, 'test/pg/**/*.test.ts'],
           // Every query is an HTTP round trip through the local Neon proxy
           // (~60-100 ms here, against well under 1 ms for local D1), so the
@@ -78,6 +82,7 @@ export default defineConfig({
         // connections, which the HTTP driver cannot hold open: plain Node + `pg`.
         test: {
           name: 'pg-node',
+          sequence: { groupOrder: 2 },
           environment: 'node',
           fileParallelism: false,
           include: ['test/pg-node/**/*.test.ts'],
