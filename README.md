@@ -30,6 +30,7 @@ verification or D1 code:
 | `@tomu-ai/workers-auth` | `createAuth`, middleware, routes, types, crypto/cookie/csrf helpers |
 | `@tomu-ai/workers-auth/store/kv` | `kvSessionStore` |
 | `@tomu-ai/workers-auth/store/d1` | `d1SessionStore`, `revocationList` |
+| `@tomu-ai/workers-auth/store/pg` | `pgSessionStore`, `pgDeviceAuthStore` (Postgres: Neon, or any Postgres via Hyperdrive) — see [Postgres stores](#postgres-stores-storepg) |
 | `@tomu-ai/workers-auth/neon` | `neonAuth`, `clearJwksCache` |
 | `@tomu-ai/workers-auth/magic-link` | `magicLink`, `kvMagicLinkStore`, `d1MagicLinkStore` |
 | `@tomu-ai/workers-auth/api-key` | `apiKey`, `issueApiKey`, `kvApiKeyStore`, `d1ApiKeyStore` |
@@ -274,6 +275,174 @@ session. **The per-user marker has no expiry of its own** — deleting it early
 would silently un-revoke every session created before it — so cleanup keeps it
 around for `maxSessionLifetimeSec` (default 90 days; set it to the longest
 `absoluteTtlSec` you configure anywhere).
+
+### Postgres stores (`./store/pg`)
+
+For apps whose data already lives in Postgres (Neon), so auth does not need a
+D1 database of its own. `pgSessionStore(executor, options?)` and
+`pgDeviceAuthStore(executor, options?)` are drop-in counterparts of
+`d1SessionStore` and `d1DeviceAuthStore`: same interface, same limits, the
+same test suites (every `deviceAuth` test runs against both). There is no
+Postgres version of the magic-link, API-key or revocation-list stores.
+
+The package ships **no Postgres driver** and declares none, not even as a peer.
+You pass an *executor* — two functions — built from the driver you already use:
+
+```ts
+type PgExecutor = {
+  // One statement, autocommit. rowCount: affected/returned rows, as a number.
+  query(text: string, params: readonly unknown[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number }>;
+  // Runs the statements in order in ONE transaction; all or nothing.
+  transaction(statements: readonly { text: string; params: readonly unknown[] }[]): Promise<{ rows; rowCount }[]>;
+};
+```
+
+**`rowCount` must be a number (required).** Drivers can report `null` (`pg`
+does for commands without a count). Throw in the adapter rather than passing
+`null` on or turning it into `0`: "unknown" read as "no rows" is how a PIN
+change could quietly skip signing the other devices out. The stores decide
+everything that matters from `RETURNING` rows, and throw if a count they do
+read (cleanup totals) is not a finite number — the adapters below do the same.
+
+**Neon over HTTP (`@neondatabase/serverless`) — the default.** One HTTPS round
+trip per query, no connection to open or close, nothing to set up per request:
+
+```ts
+import { neon } from '@neondatabase/serverless';
+import type { PgExecutor } from '@tomu-ai/workers-auth/store/pg';
+
+function counted(r: { rows: Record<string, unknown>[]; rowCount: number | null }) {
+  if (typeof r.rowCount !== 'number') throw new Error('neon: no row count in the result');
+  return { rows: r.rows, rowCount: r.rowCount };
+}
+
+export function neonExecutor(databaseUrl: string): PgExecutor {
+  const sql = neon(databaseUrl, { fullResults: true });
+  return {
+    query: async (text, params) => counted(await sql.query(text, [...params])),
+    transaction: async (statements) =>
+      (
+        await sql.transaction(statements.map((s) => sql.query(s.text, [...s.params])), { isolationLevel: 'ReadCommitted' })
+      ).map(counted),
+  };
+}
+
+const executor = neonExecutor(env.DATABASE_URL); // a `wrangler secret`, the primary's connection string
+const devices = pgDeviceAuthStore(executor);
+const sessions = deviceBoundSessionStore(pgSessionStore(executor), devices);
+```
+
+**`pg` behind Hyperdrive.** Needs `nodejs_compat`; create the client per
+request and close it when the response is done:
+
+```ts
+import { Client, type QueryResult } from 'pg';
+
+function counted(r: QueryResult) {
+  if (r.rowCount === null) throw new Error(`pg: no row count for ${r.command}`);
+  return { rows: r.rows, rowCount: r.rowCount };
+}
+
+export function clientExecutor(client: Client): PgExecutor {
+  return {
+    query: async (text, params) => counted(await client.query(text, [...params])),
+    async transaction(statements) {
+      await client.query('BEGIN');
+      try {
+        const results = [];
+        for (const s of statements) results.push(counted(await client.query(s.text, [...s.params])));
+        await client.query('COMMIT');
+        return results;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      }
+    },
+  };
+}
+
+const client = new Client({ connectionString: env.HYPERDRIVE_AUTH.connectionString });
+await client.connect();
+ctx.waitUntil(/* after the response */ client.end());
+```
+
+Both adapters are the ones the test suite uses (the Neon one against a local
+Neon HTTP proxy, the `pg` one for the row-lock tests).
+
+What the stores rely on — each one is load-bearing for revocation or a limit:
+
+- **Autocommit only — never inside a transaction your app opened.** Every
+  limit reserves its failure *before* checking a PIN or code, in a statement
+  that commits on its own. Run the executor inside an app transaction and a
+  rollback (an error later in the request, or the app's own) undoes those
+  reservations: the guesses come back, and the PIN and email-code limits stop
+  limiting. `query()` must be one autocommitted statement; `transaction()`
+  must open and commit its own transaction. There is no reliable way for the
+  store to detect the misuse itself (see SECURITY.md), so it is on the adapter.
+- **One connection per request; do not share a `pg` Client across
+  requests.** A shared client mixes requests' statements on one session —
+  including into whatever transaction another request has open — which is the
+  previous point by accident. (Neon HTTP has no connection to share.)
+
+- **Hyperdrive must be created with `--caching-disabled`.** Hyperdrive caches
+  read queries for 60 s by default and does not invalidate them on writes, so
+  a cached `SELECT` would keep a revoked session, a revoked device or an old
+  rate-limit count alive. Use a separate cache-disabled configuration for auth
+  if the rest of the app wants caching:
+  `npx wrangler hyperdrive create auth-fresh --connection-string=... --caching-disabled`.
+- **No read replicas.** Point the executor at the primary (read-write)
+  endpoint. A replica's lag is the same stale read.
+- **READ COMMITTED** — Postgres' default. Every limit is one conditional
+  statement (`INSERT … ON CONFLICT DO UPDATE … WHERE … RETURNING`, or
+  `UPDATE … WHERE … RETURNING`), and READ COMMITTED is what makes such a
+  statement wait for a concurrent writer and then re-check its condition
+  against the row that writer left. A database whose default is REPEATABLE
+  READ or SERIALIZABLE turns that wait into an error (40001); the stores retry
+  a 40001 or 40P01 (deadlock) once — and nothing else, because after a network
+  error or timeout the statement may already have committed.
+- **Two spots that D1 got for free from its single writer** are handled
+  explicitly: replacing a PIN takes a transaction-scoped advisory lock on the
+  account (key: `hashtextextended('workers-auth:credential:' || account_id, 0)`;
+  without it two concurrent PIN changes end in a unique violation), and
+  clearing the lockout state is one statement that locks the row first.
+- **No retrying `fetch` under Neon HTTP.** Do not set
+  `neonConfig.fetchFunction` to a `fetch` that retries on its own. The stores
+  deliberately do not retry after a network error or timeout — the statement
+  may already have committed, and running a failure reservation twice would
+  charge it twice. The driver itself sends each query once (checked in
+  `@neondatabase/serverless` 1.2.0: one `fetch`, no retry loop); a retrying
+  `fetchFunction` would quietly reintroduce exactly that double run.
+
+`schema` (default `public`) selects where the tables live. It must match
+`^[a-z_][a-z0-9_]{0,62}$` and is checked when the store is built. Neon Auth's
+`neon_auth` schema is untouched either way; every table here is `auth_*`.
+
+**Cold starts.** A Neon compute that has scaled to zero adds its start-up to
+the first query that reaches it: about **0.7 s** on top of a normal first
+query, measured against a 0.25 CU test project in aws-ap-southeast-1 (first
+query after idle 1.18 s, first query from a fresh process on a running
+compute 0.45 s, warm queries ~0.1 s — from a development machine, not from a
+Worker). Authentication runs on every request, so the user who wakes the
+compute feels it; configure autosuspend accordingly for production.
+
+**A least-privilege role for auth.** The stores need no DDL, no `TRUNCATE`
+and no access to anything but their own tables. After the migrations, as the
+database owner (create the role itself in the Neon console or API):
+
+```sql
+GRANT USAGE ON SCHEMA public TO workers_auth_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+  auth_sessions, auth_email_codes, auth_trusted_devices, auth_credentials, auth_rate_limits
+  TO workers_auth_app;
+GRANT SELECT, INSERT, UPDATE ON auth_login_guards TO workers_auth_app;  -- never deleted from
+```
+
+With a `schema` other than `public`, grant on that schema and its tables
+instead. The advisory-lock and hashing functions the stores call are
+executable by every role by default. These grants are verified on a local
+PostgreSQL 17 by `test/pg-node/least-privilege.test.ts`: a role holding
+exactly them runs every store method, and `TRUNCATE`, DDL and other tables
+are refused (42501).
 
 ## Layer 2: providers
 
@@ -592,7 +761,7 @@ unescaped label in a "your devices" page is a stored XSS.
 | `pin.maxAttempts` | 3 | consecutive failures before lockout, per account |
 | `pin.isWeakPin` | — | extra rule, on top of the built-in one |
 | `pin.rejectDateLike` | `false` | also refuse DDMMYY / MMDDYY / YYMMDD / YYYYMM / MMYYYY |
-| `pin.revokeOtherDevicesOnChange` | `false` | on replacing an existing PIN: revoke the other devices **and every session of the account**, including the caller's (`signedOut: true`; the current device stays trusted, so it logs in again with the new PIN) |
+| `pin.revokeOtherDevicesOnChange` | `false` | on replacing an existing PIN: revoke the other devices **and every session of the account**, including the caller's (`signedOut: true`; the current device stays trusted, so it logs in again with the new PIN). The new PIN and the devices' revocation are one transaction: both happen or neither |
 | `emailCode.ttlSec` / `.maxAttempts` | 600 / 5 | a resend inside the first code's lifetime keeps the attempts already used |
 | `emailCode.digits` | 6 | 6 or 8 |
 | `emailCode.maxFailuresPerEmail` / `.failureWindowSec` | 10 / 86,400 | failures per address across all its codes, per fixed window — see the trade-off below |
@@ -860,6 +1029,28 @@ D1 migrations ship in `migrations/`. Apply only what you use:
 npx wrangler d1 migrations apply <db> --local
 ```
 
+**Postgres:** `migrations/pg/` holds the same files with the same numbers
+(times are `BIGINT` milliseconds, counters `INTEGER`, JSON `TEXT`). The stores
+need `0001_sessions.sql` and `0006_device_auth.sql`; `0002`–`0005` create the
+tables of the D1/KV-only stores so both schemas stay alike. There is no
+migration runner on Neon's side — apply them in order with any client, for
+example:
+
+```bash
+for f in node_modules/@tomu-ai/workers-auth/migrations/pg/000{1,6}_*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
+```
+
+For a schema other than `public`, create it and apply with that search path
+(table names in the files are unqualified), then pass the same `schema`:
+
+```bash
+psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS workers_auth'
+PGOPTIONS='-c search_path=workers_auth' psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f .../0006_device_auth.sql
+```
+
+A test (`test/pg/schema.test.ts`) fails if the D1 and Postgres files ever
+disagree on a table, column, nullability, primary key or index.
+
 ## Testing your integration
 
 ### Prefer real KV/D1 over hand-rolled fakes
@@ -1105,9 +1296,26 @@ own migrations, apply both directories in `apply-migrations.ts`.
 ```bash
 pnpm install
 pnpm typecheck
-pnpm test        # vitest + @cloudflare/vitest-pool-workers (runs on workerd)
+pnpm pg:up       # Docker: postgres:17 + a local Neon HTTP proxy (random password in test/pg/.env)
+pnpm test        # all three vitest projects, one after another (below)
+pnpm test:d1     # D1 only — no Docker needed
+pnpm pg:down     # stop Postgres and delete its data and password file
 pnpm build       # tsup, ESM + d.ts
 ```
+
+Three vitest projects: **d1** (everything, on workerd with Miniflare KV/D1),
+**pg** (the `deviceAuth` suites and the store contract again, on workerd,
+against Postgres through `@neondatabase/serverless` and the local proxy) and
+**pg-node** (Node + `pg`: row-lock interleavings on two held-open connections,
+which an HTTP driver cannot do). Without `pnpm pg:up` the pg projects fail with
+a message saying so; they never skip.
+
+`pnpm test:neon` runs the same Postgres suites against a real Neon project
+instead, reading a direct (non-pooler) connection string from
+`test/pg/.env.neon` (`NEON_TEST_DATABASE_URL=...`, gitignored). Only that
+command targets Neon — plain `pnpm test` never reads the file — and it first
+refuses, before truncating or creating anything, any database that holds a
+table or view other than `auth_*`: point it at a dedicated test project only.
 
 Tests run on real Miniflare KV and D1. The `deviceAuth` suites use 1,000 PBKDF2
 iterations to stay fast; one test exercises the 100,000 default end to end. Stores, providers and `createAuth` all

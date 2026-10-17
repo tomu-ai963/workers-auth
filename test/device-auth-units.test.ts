@@ -1,9 +1,7 @@
-import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { randomToken } from '../src/crypto.js';
 import { isWeakPin, pinCredential } from '../src/device-auth/credentials.js';
-import { d1DeviceAuthStore } from '../src/device-auth/index.js';
 import { buildKeyRing } from '../src/device-auth/keys.js';
 import { createAuth } from '../src/index.js';
 import {
@@ -12,9 +10,9 @@ import {
   revokeBearerSession,
   sessionBearer,
 } from '../src/providers/session-bearer.js';
-import { d1SessionStore } from '../src/store/d1.js';
 import { extractEmailCodeFromEmail } from '../src/testing.js';
 import { resetStorage } from './helpers/reset.js';
+import { db, makeDeviceStore, makeSessionStore } from './helpers/backend.js';
 
 beforeEach(async () => {
   await resetStorage();
@@ -73,7 +71,7 @@ describe('key ring', () => {
 });
 
 describe('d1DeviceAuthStore', () => {
-  const store = () => d1DeviceAuthStore(env.DB, { clock: () => NOW });
+  const store = () => makeDeviceStore({ clock: () => NOW });
 
   it('reserveLoginAttempt refuses past the limit and while locked', async () => {
     const s = store();
@@ -162,10 +160,10 @@ describe('d1DeviceAuthStore', () => {
       updatedAt: NOW,
       lastUsedAt: null,
     });
-    expect(await s.replaceCredential(cred('p1', 'pin'))).toBe(false);
-    expect(await s.replaceCredential(cred('p2', 'pin'))).toBe(true);
+    expect(await s.replaceCredential(cred('p1', 'pin'))).toEqual({ replaced: false, devicesRevoked: 0 });
+    expect(await s.replaceCredential(cred('p2', 'pin'))).toEqual({ replaced: true, devicesRevoked: 0 });
     expect((await s.getActiveCredential('acct', 'pin'))?.credentialId).toBe('p2');
-    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM auth_credentials WHERE revoked_at IS NULL AND type = 'pin'").first('n')).toBe(1);
+    expect(await db.prepare("SELECT COUNT(*) AS n FROM auth_credentials WHERE revoked_at IS NULL AND type = 'pin'").first('n')).toBe(1);
 
     await s.replaceCredential(cred('k1', 'passkey'));
     expect((await s.getActiveCredential('acct', 'passkey'))?.material).toEqual({ v: 'k1' });
@@ -179,8 +177,8 @@ describe('d1DeviceAuthStore', () => {
     await s.hitRateLimit('old', 1000, NOW - 2 * 86_400_000);
     await s.hitRateLimit('new', 1000, NOW);
     expect(await s.cleanup(NOW)).toBe(2);
-    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_email_codes').first('n')).toBe(1);
-    expect(await env.DB.prepare('SELECT bucket FROM auth_rate_limits').first('bucket')).toBe('new');
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM auth_email_codes').first('n')).toBe(1);
+    expect(await db.prepare('SELECT bucket FROM auth_rate_limits').first('bucket')).toBe('new');
   });
 });
 
@@ -196,7 +194,7 @@ describe('sessionBearer', () => {
   });
 
   it('verifies a bearer session, refuses a cookie session, and revokes', async () => {
-    const store = d1SessionStore(env.DB);
+    const store = makeSessionStore();
     const auth = createAuth({ providers: [], store });
     const fakeContext = { req: { raw: new Request('https://x.example') }, header() {} } as never;
     const bearer = await auth.createSession(fakeContext, { id: 'u', subjectType: 'user', rateLimitId: 'u', claims: {} }, {

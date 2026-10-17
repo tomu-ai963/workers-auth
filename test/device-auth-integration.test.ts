@@ -3,7 +3,6 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { randomToken } from '../src/crypto.js';
 import {
-  d1DeviceAuthStore,
   deviceAuth,
   deviceBoundSessionStore,
   type DeviceAuthStore,
@@ -11,7 +10,6 @@ import {
 import { createAuth } from '../src/index.js';
 import { d1MagicLinkStore, magicLink } from '../src/providers/magic-link.js';
 import { sessionBearer } from '../src/providers/session-bearer.js';
-import { d1SessionStore } from '../src/store/d1.js';
 import { resetStorage } from './helpers/reset.js';
 import {
   call,
@@ -27,6 +25,7 @@ import {
   T0,
   time,
 } from './helpers/device.js';
+import { db, makeDeviceStore, makeSessionStore } from './helpers/backend.js';
 
 beforeEach(async () => {
   time.now = T0;
@@ -96,12 +95,12 @@ describe('bearer sessions (transport: response)', () => {
   });
 
   it('a bearer login does not rotate out a cookie session on the same request', async () => {
-    const store = deviceBoundSessionStore(d1SessionStore(env.DB, { clock }), d1DeviceAuthStore(env.DB), { clock });
+    const store = deviceBoundSessionStore(makeSessionStore({ clock }), makeDeviceStore(), { clock });
     const auth = createAuth({ providers: [sessionBearer({ store })], store, clock });
-    const before = await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_sessions').first('n');
+    const before = await db.prepare('SELECT COUNT(*) AS n FROM auth_sessions').first('n');
     const h = setup({ transport: 'response', auth });
     await loginByEmail(h, client(), EMAIL);
-    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_sessions').first('n')).toBe(Number(before) + 1);
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM auth_sessions').first('n')).toBe(Number(before) + 1);
   });
 });
 
@@ -134,7 +133,7 @@ describe('CSRF (transport: cookie)', () => {
     const c = await enrolled(h, EMAIL);
     const forged = await call(h, { ...c, origin: EVIL }, 'POST', '/auth/device/pin/login', { pin: '739164' });
     expect(forged.status).toBe(403);
-    expect((await env.DB.prepare('SELECT failed_count FROM auth_login_guards').first('failed_count')) ?? 0).toBe(0);
+    expect((await db.prepare('SELECT failed_count FROM auth_login_guards').first('failed_count')) ?? 0).toBe(0);
   });
 
   it('requires the double-submit header once a CSRF cookie exists', async () => {
@@ -165,11 +164,11 @@ describe('secret rotation (previousSecrets)', () => {
   it('verifies a PIN made with a previous secret, then re-hashes it under the current one', async () => {
     const old = setup({ transport: 'response', secret: SECRET_A });
     const c = await enrolled(old, EMAIL);
-    const before = JSON.parse((await env.DB.prepare('SELECT material FROM auth_credentials').first('material')) as string);
+    const before = JSON.parse((await db.prepare('SELECT material FROM auth_credentials').first('material')) as string);
 
     const rotated = setup({ transport: 'response', secret: SECRET_B, previousSecrets: [SECRET_A] });
     expect((await pinLogin(rotated, c, PIN)).status).toBe(200);
-    const after = JSON.parse((await env.DB.prepare('SELECT material FROM auth_credentials').first('material')) as string);
+    const after = JSON.parse((await db.prepare('SELECT material FROM auth_credentials').first('material')) as string);
     expect(after.pepperVer).not.toBe(before.pepperVer);
     expect(after.salt).not.toBe(before.salt);
 
@@ -261,11 +260,11 @@ describe('audit events', () => {
 describe('coexistence with magic links', () => {
   function withMagicLink() {
     const tokens: string[] = [];
-    const sessionStore = deviceBoundSessionStore(d1SessionStore(env.DB, { clock }), d1DeviceAuthStore(env.DB), {
+    const sessionStore = deviceBoundSessionStore(makeSessionStore({ clock }), makeDeviceStore(), {
       clock,
     });
     const provider = magicLink({
-      store: d1MagicLinkStore(env.DB, { clock }),
+      store: d1MagicLinkStore(env.DB, { clock }), // magic links have no Postgres store: D1 in both projects
       sendToken: async (_email, token) => {
         tokens.push(token);
       },
@@ -303,23 +302,23 @@ describe('coexistence with magic links', () => {
 
 describe('construction', () => {
   const base = () => {
-    const store = deviceBoundSessionStore(d1SessionStore(env.DB), d1DeviceAuthStore(env.DB));
+    const store = deviceBoundSessionStore(makeSessionStore(), makeDeviceStore());
     return { auth: createAuth({ providers: [], store }), sendCode: async () => {}, secret: randomToken() };
   };
 
   it('refuses a store that cannot update counters atomically', () => {
-    const fake = { ...d1DeviceAuthStore(env.DB), atomic: false } as DeviceAuthStore;
+    const fake = { ...makeDeviceStore(), atomic: false } as DeviceAuthStore;
     expect(() => deviceAuth({ ...base(), store: fake, transport: 'cookie' })).toThrow(/atomic/);
   });
 
   it('requires an explicit transport', () => {
     expect(() =>
-      deviceAuth({ ...base(), store: d1DeviceAuthStore(env.DB), transport: undefined as unknown as 'cookie' }),
+      deviceAuth({ ...base(), store: makeDeviceStore(), transport: undefined as unknown as 'cookie' }),
     ).toThrow(/transport/);
   });
 
   it('bounds PBKDF2 iterations to what Workers supports', () => {
-    const opts = { ...base(), store: d1DeviceAuthStore(env.DB), transport: 'cookie' as const };
+    const opts = { ...base(), store: makeDeviceStore(), transport: 'cookie' as const };
     expect(() => deviceAuth({ ...opts, pin: { iterations: 100_001 } })).toThrow(/iterations/);
     expect(() => deviceAuth({ ...opts, pin: { iterations: 999 } })).toThrow(/iterations/);
     expect(() => deviceAuth({ ...opts, pin: { iterations: 10_000 } })).not.toThrow();
@@ -329,7 +328,7 @@ describe('construction', () => {
     expect(() =>
       deviceAuth({
         ...base(),
-        store: d1DeviceAuthStore(env.DB),
+        store: makeDeviceStore(),
         transport: 'cookie',
         device: { idleTtlSec: 100, absoluteTtlSec: 50 },
       }),

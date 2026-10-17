@@ -1,4 +1,3 @@
-import { env } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { sha256Hex } from '../src/crypto.js';
@@ -18,6 +17,7 @@ import {
   time,
   type Harness,
 } from './helpers/device.js';
+import { db } from './helpers/backend.js';
 
 beforeEach(async () => {
   time.now = T0;
@@ -45,7 +45,7 @@ function countPbkdf2() {
 }
 
 async function guard(accountId: string) {
-  return env.DB.prepare('SELECT failed_count, locked_at FROM auth_login_guards WHERE account_id = ?1')
+  return db.prepare('SELECT failed_count, locked_at FROM auth_login_guards WHERE account_id = ?1')
     .bind(accountId)
     .first<{ failed_count: number; locked_at: number | null }>();
 }
@@ -56,7 +56,7 @@ describe('trusted devices', { timeout: HEAVY_TIMEOUT }, () => {
     const c = client();
     await loginByEmail(h, c, EMAIL);
     const [deviceId, secret] = (c.deviceToken as string).split('.') as [string, string];
-    const row = await env.DB.prepare('SELECT * FROM auth_trusted_devices WHERE device_id = ?1').bind(deviceId).first();
+    const row = await db.prepare('SELECT * FROM auth_trusted_devices WHERE device_id = ?1').bind(deviceId).first();
     expect(JSON.stringify(row)).not.toContain(secret);
     expect(row?.['secret_hash']).toBe(await sha256Hex(secret));
   });
@@ -93,7 +93,7 @@ describe('trusted devices', { timeout: HEAVY_TIMEOUT }, () => {
     time.now += 2 * MIN;
     const second = await loginByEmail(h, c, EMAIL);
     expect(second.body?.['device']?.['deviceId']).toBe(first.body?.['device']?.['deviceId']);
-    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_trusted_devices').first('n')).toBe(1);
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM auth_trusted_devices').first('n')).toBe(1);
   });
 
   it('never reuses another account’s device token', async () => {
@@ -112,7 +112,7 @@ describe('trusted devices', { timeout: HEAVY_TIMEOUT }, () => {
     const h = setup();
     const res = await loginByEmail(h, client(), EMAIL, { trustDevice: false });
     expect(res.body?.['device']).toBeNull();
-    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_trusted_devices').first('n')).toBe(0);
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM auth_trusted_devices').first('n')).toBe(0);
   });
 
   it('rejects a revoked device', async () => {
@@ -229,7 +229,7 @@ describe('PIN enrolment', { timeout: HEAVY_TIMEOUT }, () => {
     const h = setup();
     await enrolled(h, EMAIL);
     await enrolled(h, 'bob@example.com');
-    const rows = (await env.DB.prepare("SELECT material FROM auth_credentials WHERE type = 'pin'").all<{ material: string }>()).results;
+    const rows = (await db.prepare("SELECT material FROM auth_credentials WHERE type = 'pin'").all<{ material: string }>()).results;
     expect(rows).toHaveLength(2);
     const [a, b] = rows.map((r) => JSON.parse(r.material));
     expect(a.salt).not.toBe(b.salt);
@@ -240,7 +240,7 @@ describe('PIN enrolment', { timeout: HEAVY_TIMEOUT }, () => {
   it('uses 100,000 PBKDF2 iterations by default', async () => {
     const h = setup({ pin: {} });
     await enrolled(h, EMAIL);
-    const row = await env.DB.prepare('SELECT material FROM auth_credentials').first<{ material: string }>();
+    const row = await db.prepare('SELECT material FROM auth_credentials').first<{ material: string }>();
     expect(JSON.parse(row?.material as string)).toMatchObject({ alg: 'pbkdf2-sha256', iterations: 100_000 });
   });
 

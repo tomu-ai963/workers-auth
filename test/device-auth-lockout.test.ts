@@ -18,14 +18,12 @@ import security from '../SECURITY.md?raw';
 import credentialsSource from '../src/device-auth/credentials.ts?raw';
 import notices from '../THIRD_PARTY_NOTICES?raw';
 import {
-  d1DeviceAuthStore,
   deviceAuth,
   deviceBoundSessionStore,
   isDeviceBoundSessionStore,
 } from '../src/device-auth/index.js';
 import { createAuth, getUser, type Auth } from '../src/index.js';
 import { sessionBearer } from '../src/providers/session-bearer.js';
-import { d1SessionStore } from '../src/store/d1.js';
 import type { SessionStore } from '../src/types.js';
 import { resetStorage } from './helpers/reset.js';
 import {
@@ -50,6 +48,7 @@ import {
   type Client,
   type Harness,
 } from './helpers/device.js';
+import { db, makeDeviceStore, makeSessionStore } from './helpers/backend.js';
 
 beforeEach(async () => {
   time.now = T0;
@@ -67,7 +66,7 @@ async function lockPin(h: Harness, c: Client) {
 }
 
 async function bucketCount(prefix: string): Promise<number> {
-  const n = await env.DB.prepare('SELECT COALESCE(SUM(count), 0) AS n FROM auth_rate_limits WHERE bucket LIKE ?1')
+  const n = await db.prepare('SELECT COALESCE(SUM(count), 0) AS n FROM auth_rate_limits WHERE bucket LIKE ?1')
     .bind(`${prefix}%`)
     .first('n');
   return Number(n);
@@ -249,7 +248,7 @@ function comparedGuesses(h: Harness): number {
 }
 
 async function failureCount(bucketPattern: string): Promise<number> {
-  const n = await env.DB.prepare('SELECT count FROM auth_rate_limits WHERE bucket LIKE ?1').bind(bucketPattern).first('count');
+  const n = await db.prepare('SELECT count FROM auth_rate_limits WHERE bucket LIKE ?1').bind(bucketPattern).first('count');
   return Number(n ?? 0);
 }
 
@@ -374,13 +373,13 @@ describe('P1-A (c): botCheck covers /email/verify', { timeout: HEAVY_TIMEOUT }, 
     });
     const email = 'bot@example.com';
     await call(h, client(), 'POST', START, { email });
-    const before = Number(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_rate_limits').first('n'));
+    const before = Number(await db.prepare('SELECT COUNT(*) AS n FROM auth_rate_limits').first('n'));
     const res = await call(h, client({ ip: '192.0.2.1' }), 'POST', VERIFY, { email, code: h.lastCode(email) });
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: 'bot_check_failed' });
     expect(h.events).toContainEqual({ type: 'bot_check.failed', action: 'email_verify' });
-    expect(Number(await env.DB.prepare('SELECT COUNT(*) AS n FROM auth_rate_limits').first('n'))).toBe(before);
-    expect(await env.DB.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(0);
+    expect(Number(await db.prepare('SELECT COUNT(*) AS n FROM auth_rate_limits').first('n'))).toBe(before);
+    expect(await db.prepare('SELECT attempts FROM auth_email_codes').first('attempts')).toBe(0);
     expect(seen).toEqual(['email_start', 'email_verify']);
 
     expect((await call(h, client({ ip: '192.0.2.50' }), 'POST', VERIFY, { email, code: h.lastCode(email) })).status).toBe(200);
@@ -405,7 +404,7 @@ describe('P1-A (c): botCheck covers /email/verify', { timeout: HEAVY_TIMEOUT }, 
 
 describe('P2-D: circuit breaker', { timeout: HEAVY_TIMEOUT }, () => {
   const breakerRow = () =>
-    env.DB.prepare("SELECT count, failures, window_start FROM auth_rate_limits WHERE bucket = 'cb:email-verify'").first<{
+    db.prepare("SELECT count, failures, window_start FROM auth_rate_limits WHERE bucket = 'cb:email-verify'").first<{
       count: number;
       failures: number;
       window_start: number;
@@ -511,8 +510,8 @@ const WRAPPERS = [
 
 describe('P2-C: device binding holds through wrappers', { timeout: HEAVY_TIMEOUT }, () => {
   it('only the object deviceBoundSessionStore() returned is recognised', () => {
-    const devices = d1DeviceAuthStore(env.DB);
-    const raw = d1SessionStore(env.DB);
+    const devices = makeDeviceStore();
+    const raw = makeSessionStore();
     const wrapped = deviceBoundSessionStore(raw, devices);
     expect(isDeviceBoundSessionStore(wrapped)).toBe(true);
     expect(isDeviceBoundSessionStore(Object.create(wrapped))).toBe(false);
@@ -522,8 +521,8 @@ describe('P2-C: device binding holds through wrappers', { timeout: HEAVY_TIMEOUT
   });
 
   it.each(WRAPPERS)('deviceAuth refuses an Auth over a %s wrapper', (_name, make) => {
-    const devices = d1DeviceAuthStore(env.DB);
-    const raw = d1SessionStore(env.DB);
+    const devices = makeDeviceStore();
+    const raw = makeSessionStore();
     const store = make(deviceBoundSessionStore(raw, devices), raw);
     const auth = createAuth({ providers: [], store });
     expect(() =>
@@ -539,7 +538,7 @@ describe('P2-C: device binding holds through wrappers', { timeout: HEAVY_TIMEOUT
     const h = setup();
     const c = await enrolled(h, 'cookie-wrap@example.com', PIN);
     const cookie = `__Host-session=${c.jar['__Host-session']}`;
-    const raw = d1SessionStore(env.DB, { clock });
+    const raw = makeSessionStore({ clock });
     const read = sideApp(make(h.sessionStore, raw));
     const good = sideApp(h.sessionStore);
 
@@ -556,7 +555,7 @@ describe('P2-C: device binding holds through wrappers', { timeout: HEAVY_TIMEOUT
     const h = setup({ transport: 'response' });
     const c = await enrolled(h, 'bearer-wrap@example.com', PIN);
     const authorization = `Bearer ${c.sessionToken}`;
-    const raw = d1SessionStore(env.DB, { clock });
+    const raw = makeSessionStore({ clock });
     const read = sideApp(make(h.sessionStore, raw));
     const good = sideApp(h.sessionStore);
 
@@ -573,11 +572,11 @@ describe('P2-C: device binding holds through wrappers', { timeout: HEAVY_TIMEOUT
     const h = setup({ transport: 'response' });
     const c = client();
     await loginByEmail(h, c, 'nodev@example.com', { trustDevice: false });
-    const raw = d1SessionStore(env.DB, { clock });
+    const raw = makeSessionStore({ clock });
     expect((await sideApp(appWrapper(raw))({ authorization: `Bearer ${c.sessionToken}` })).status).toBe(200);
 
     const owner = await enrolled(h, 'inside@example.com', PIN);
-    const inside = deviceBoundSessionStore(appWrapper(raw), d1DeviceAuthStore(env.DB), { clock });
+    const inside = deviceBoundSessionStore(appWrapper(raw), makeDeviceStore(), { clock });
     expect((await sideApp(inside)({ authorization: `Bearer ${owner.sessionToken}` })).status).toBe(200);
   });
 });

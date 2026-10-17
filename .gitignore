@@ -5,3 +5,5 @@ dist/
 .dev.vars
 .DS_Store
 .claude/settings.local.json
+test/pg/.env
+test/pg/.env.neon

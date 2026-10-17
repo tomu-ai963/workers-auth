@@ -64,6 +64,30 @@ export type CredentialRecord = {
   lastUsedAt: number | null;
 };
 
+export type ReplaceCredentialOptions = {
+  /**
+   * Also clear the account's failure count and lock (`resetLoginGuard`), in
+   * the same transaction: the counter belonged to the credential being
+   * replaced, so it is cleared exactly when — and only if — the new one
+   * exists.
+   */
+  resetLoginGuard?: boolean;
+  /**
+   * If a live credential of the type is being replaced, also revoke every
+   * other device of the account (all but `exceptDeviceId`), in the same
+   * transaction: the new credential and the revocation take effect together
+   * or not at all. Nothing is revoked when there was no credential to replace.
+   */
+  revokeOtherDevices?: { exceptDeviceId: string | null };
+};
+
+export type ReplaceCredentialResult = {
+  /** Whether a live credential of the type existed and was revoked. */
+  replaced: boolean;
+  /** Devices revoked by `revokeOtherDevices` (0 when not asked, or nothing was replaced). */
+  devicesRevoked: number;
+};
+
 export type CircuitBreakerState = { attempts: number; failures: number; windowStart: number };
 
 export type GuardState = {
@@ -126,8 +150,12 @@ export interface DeviceAuthStore {
   revokeAllDevices(accountId: string, now: number, exceptDeviceId?: string | null): Promise<number>;
 
   getActiveCredential(accountId: string, type: CredentialType): Promise<CredentialRecord | null>;
-  /** Revokes the live credential of `type` (if any) and inserts the new one, atomically. Returns whether one was replaced. */
-  replaceCredential(record: CredentialRecord): Promise<boolean>;
+  /**
+   * Revokes the live credential of `type` (if any) and inserts the new one —
+   * with the options' extra steps — in one transaction: all of it or none.
+   * The revocation time is `record.updatedAt`.
+   */
+  replaceCredential(record: CredentialRecord, options?: ReplaceCredentialOptions): Promise<ReplaceCredentialResult>;
   markCredentialUsed(credentialId: string, now: number, material?: CredentialMaterial): Promise<void>;
 
   /**
@@ -438,10 +466,25 @@ export function d1DeviceAuthStore(
       };
     },
 
-    async replaceCredential(r) {
-      // One transaction: the partial unique index allows only one live PIN,
-      // so the old one has to be revoked before the insert, never after.
-      const [revoked] = await db.batch([
+    async replaceCredential(r, options = {}) {
+      // One batch = one transaction. Order matters: the devices are revoked
+      // first, conditioned on a live credential still existing (the one about
+      // to be replaced); then the old credential is revoked before the insert,
+      // since the partial unique index allows only one live PIN.
+      const statements: D1PreparedStatement[] = [];
+      if (options.revokeOtherDevices) {
+        statements.push(
+          db
+            .prepare(
+              `UPDATE ${devices} SET revoked_at = ?2
+                WHERE account_id = ?1 AND revoked_at IS NULL AND device_id IS NOT ?3
+                  AND EXISTS (SELECT 1 FROM ${creds} WHERE account_id = ?1 AND type = ?4 AND revoked_at IS NULL)`,
+            )
+            .bind(r.accountId, r.updatedAt, options.revokeOtherDevices.exceptDeviceId, r.type),
+        );
+      }
+      const revokeAt = statements.length;
+      statements.push(
         db
           .prepare(
             `UPDATE ${creds} SET revoked_at = ?3, updated_at = ?3
@@ -463,8 +506,19 @@ export function d1DeviceAuthStore(
             r.createdAt,
             r.updatedAt,
           ),
-      ]);
-      return (revoked?.meta.changes ?? 0) > 0;
+      );
+      if (options.resetLoginGuard) {
+        statements.push(
+          db
+            .prepare(`UPDATE ${guards} SET failed_count = 0, locked_at = NULL, updated_at = ?2 WHERE account_id = ?1`)
+            .bind(r.accountId, r.updatedAt),
+        );
+      }
+      const results = await db.batch(statements);
+      return {
+        replaced: (results[revokeAt]?.meta.changes ?? 0) > 0,
+        devicesRevoked: options.revokeOtherDevices ? (results[0]?.meta.changes ?? 0) : 0,
+      };
     },
 
     async markCredentialUsed(credentialId, now, material) {
