@@ -584,7 +584,9 @@ trusted device: POST /pin/login {pin}           -> session
                   3rd wrong PIN                 -> 401 email_verification_required  (account locked)
 ```
 
-Apply `migrations/0006_device_auth.sql`. The store is D1 only:
+Apply `migrations/0006_device_auth.sql` (D1) or `migrations/pg/0006_device_auth.sql`
+(Postgres). The store is `d1DeviceAuthStore` or `pgDeviceAuthStore`
+([Postgres stores](#postgres-stores-storepg)) — there is no KV version:
 `deviceAuth()` refuses a store that does not declare `atomic: true`, because
 every limit here (5 tries per code, 10 failures per address or per trusted
 device per day window, 3 PIN failures, resend cooldowns) must hold under
@@ -600,7 +602,7 @@ It throws, rather than letting a gap surface during an incident, unless:
    only for such sessions) and refuses — and deletes — the session once the
    device is revoked, expired, or no longer the account's. That is what makes
    revoking a device end the sessions on it, for cookie and bearer sessions
-   alike. Use the same D1 database for both stores.
+   alike. Use the same database for both stores.
 
    Only the exact object `deviceBoundSessionStore()` returns counts — it is
    recorded in a registry, so an `Object.create()` of it or an app wrapper
