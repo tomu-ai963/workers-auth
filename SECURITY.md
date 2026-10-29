@@ -222,11 +222,15 @@ only persisted when `storeUserClaims` is on (see
 on request 2+ would rebuild `AuthUser` via `sessionToUser()` from the stored
 session and lose `rateLimitId`, even though request 1 (the login itself) had
 it — a rate limiter reading `user.rateLimitId` would then see it only on
-`POST /session`, not on the requests that follow. `sessionToUser()` falls
-back to `session.userId` when a stored session predates this field (a session
-written by a version of this SDK before `rateLimitId` existed), so an
-in-flight session across a deploy never surfaces an empty value — see
-[Known limits](#known-limits) for what that fallback means operationally.
+`POST /session`, not on the requests that follow.
+
+A stored session with no `rateLimitId` (only possible for one written by a
+pre-0.2.0 SDK) is treated as no session: the cookie and bearer readers refuse
+it, and `sessionToUser()` returns `null` for it. Up to 0.3.x, `sessionToUser()`
+instead fell back to `session.userId`. That kept pre-upgrade sessions alive
+across a deploy, but handed a rate limiter a value no provider had chosen —
+for an `apiKey`-style subject, the wrong bucket. The cost of failing closed is
+one extra sign-in for a session that old.
 
 **Enforcement.** `AuthUser.rateLimitId` is a required field, and
 `verifyProviders()` throws if a provider (built-in or custom) returns a user

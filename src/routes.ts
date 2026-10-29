@@ -73,9 +73,9 @@ export async function createSessionFor(
   // Mirrors the `verifyProviders()` guard for the same field: a caller that
   // verifies its own credentials (password auth, OAuth, etc.) and hands the
   // result straight to `createSession` bypasses that check entirely, so this
-  // is the other AuthUser entry point that must fail closed rather than
-  // silently fall back to `userId` in `sessionToUser` — see its rateLimitId
-  // doc comment. Checked before the previous session is revoked below, so a
+  // is the other AuthUser entry point that must fail closed. A session
+  // written without rateLimitId would be unreadable afterwards anyway (see
+  // `hasRateLimitId`). Checked before the previous session is revoked below, so a
   // bad call doesn't burn the caller's existing session on its way to
   // throwing.
   if (typeof user.rateLimitId !== 'string' || user.rateLimitId.length === 0) {
@@ -213,8 +213,9 @@ export function createRoutes(config: ResolvedAuthConfig): Hono {
    */
   app.get('/session', async (c) => {
     const { session } = await readCookieSession(c, config);
-    if (!session) return c.json(unauthorizedBody(), 401);
-    return c.json({ user: sessionToUser(session), session: publicSession(session) });
+    const user = session ? sessionToUser(session) : null;
+    if (!session || !user) return c.json(unauthorizedBody(), 401);
+    return c.json({ user, session: publicSession(session) });
   });
 
   app.post('/logout', async (c) => {

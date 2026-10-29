@@ -16,7 +16,7 @@
  *     cookie session id, if it ever leaked, cannot be replayed as a bearer.
  */
 
-import { deviceCheckApplied, isBearerSession, sessionToUser } from '../middleware.js';
+import { deviceCheckApplied, hasRateLimitId, isBearerSession, sessionToUser } from '../middleware.js';
 import type { AuthProvider, AuthUser, Session, SessionStore } from '../types.js';
 
 export const BEARER_SESSION_PREFIX = 'wsb_';
@@ -48,7 +48,9 @@ export async function readBearerSession(store: SessionStore, req: Request): Prom
   const sid = readBearerSessionId(req);
   if (!sid) return null;
   const session = await store.get(sid);
-  return session && isBearerSession(session) && deviceCheckApplied(store, session) ? session : null;
+  return session && isBearerSession(session) && deviceCheckApplied(store, session) && hasRateLimitId(session)
+    ? session
+    : null;
 }
 
 /** Revokes the presented bearer session. Resolves false when there was none. */

@@ -1191,7 +1191,12 @@ export function deviceAuth(options: DeviceAuthOptions): DeviceAuth {
           applyNoStore(c);
           return emailVerificationRequired(c);
         }
-        c.set('user', sessionToUser(g.session));
+        const user = sessionToUser(g.session);
+        if (!user) {
+          applyNoStore(c);
+          return c.json({ error: 'unauthenticated' as const }, 401);
+        }
+        c.set('user', user);
         c.set('authSession', toSessionInfo(g.session));
         return next();
       };

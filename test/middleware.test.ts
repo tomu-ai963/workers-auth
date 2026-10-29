@@ -2,7 +2,14 @@ import { env } from 'cloudflare:test';
 import { Hono } from 'hono';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import { createAuth, getOptionalUser, getSession, getUser, type CreateAuthOptions } from '../src/index.js';
+import {
+  createAuth,
+  getOptionalUser,
+  getSession,
+  getUser,
+  sessionToUser,
+  type CreateAuthOptions,
+} from '../src/index.js';
 import { d1MagicLinkStore, magicLink } from '../src/providers/magic-link.js';
 import { kvSessionStore } from '../src/store/kv.js';
 import { cookieHeader, getSetCookies, loginForCookies, readCookieJar, type CookieJar } from '../src/testing.js';
@@ -360,34 +367,71 @@ describe('rateLimitId', () => {
     expect(user.rateLimitId).toBe('user_2');
   });
 
-  it('falls back to userId when reconstructing a session written before rateLimitId existed', async () => {
-    const store = kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true });
-    const auth = createAuth({
-      providers: [stubProvider],
-      store,
-      session: { idleTtlSec: 7 * DAY, absoluteTtlSec: 30 * DAY, touchIntervalSec: 60 },
-      clock,
-    });
-    const app = new Hono();
-    app.use('/api/*', auth.middleware());
-    app.get('/api/me', (c) => c.json(getUser(c)));
+  describe('a session written before rateLimitId existed (pre-0.2.0)', () => {
+    async function legacySetup() {
+      const store = kvSessionStore(env.KV, { clock, allowUnrevocableSessions: true });
+      const auth = createAuth({
+        providers: [stubProvider],
+        store,
+        session: { idleTtlSec: 7 * DAY, absoluteTtlSec: 30 * DAY, touchIntervalSec: 60 },
+        clock,
+      });
+      const app = new Hono();
+      app.route('/auth', auth.routes());
+      app.use('/api/*', auth.middleware({ optional: true }));
+      app.get('/api/me', (c) => c.json({ user: getOptionalUser(c) ?? null }));
+      app.use('/strict/*', auth.middleware());
+      app.get('/strict/me', (c) => c.json(getUser(c)));
 
-    // Stand-in for a session record written by a pre-upgrade deploy: no
-    // `rateLimitId` under `meta.__auth` at all, since that key didn't exist
-    // yet when the session was created.
-    const session = await store.create({
-      userId: 'legacy_user',
-      subjectType: 'user',
-      idleTtlSec: 7 * DAY,
-      absoluteTtlSec: 30 * DAY,
-      meta: { __auth: { email: 'legacy@example.com' } },
+      // Stand-in for a session record written by a pre-upgrade deploy: no
+      // `rateLimitId` under `meta.__auth` at all, since that key didn't exist
+      // yet when the session was created.
+      const session = await store.create({
+        userId: 'legacy_user',
+        subjectType: 'user',
+        idleTtlSec: 7 * DAY,
+        absoluteTtlSec: 30 * DAY,
+        meta: { __auth: { email: 'legacy@example.com' } },
+      });
+      return { app, store, cookie: `${SESSION_COOKIE}=${session.sid}`, session };
+    }
+
+    it('is refused by the middleware rather than given a guessed rateLimitId', async () => {
+      const { app, cookie } = await legacySetup();
+      const res = await app.fetch(new Request(`${ORIGIN}/strict/me`, { headers: { cookie } }));
+      expect(res.status).toBe(401);
     });
 
-    const res = await app.fetch(
-      new Request(`${ORIGIN}/api/me`, { headers: { cookie: `${SESSION_COOKIE}=${session.sid}` } }),
-    );
-    expect(res.status).toBe(200);
-    expect(((await res.json()) as AuthUser).rateLimitId).toBe('legacy_user');
+    it('reads as signed out under optional middleware and on GET /session', async () => {
+      const { app, cookie } = await legacySetup();
+      const me = await app.fetch(new Request(`${ORIGIN}/api/me`, { headers: { cookie } }));
+      expect(me.status).toBe(200);
+      expect(await me.json()).toEqual({ user: null });
+
+      const session = await app.fetch(new Request(`${ORIGIN}/auth/session`, { headers: { cookie } }));
+      expect(session.status).toBe(401);
+    });
+
+    it('does not block signing in again, and the new session carries rateLimitId', async () => {
+      const { app, cookie } = await legacySetup();
+      const res = await app.fetch(
+        new Request(`${ORIGIN}/auth/session`, {
+          method: 'POST',
+          headers: { origin: ORIGIN, cookie, 'x-test-user': 'legacy_user' },
+        }),
+      );
+      expect(res.status).toBe(200);
+      const jar = readCookieJar(res);
+      const me = (await (
+        await app.fetch(new Request(`${ORIGIN}/strict/me`, { headers: { cookie: cookieHeader(jar) } }))
+      ).json()) as AuthUser;
+      expect(me.rateLimitId).toBe('legacy_user');
+    });
+
+    it('sessionToUser returns null for it', async () => {
+      const { session } = await legacySetup();
+      expect(sessionToUser(session)).toBeNull();
+    });
   });
 
   it('fails closed, with an auditable reason, when a provider omits it', async () => {

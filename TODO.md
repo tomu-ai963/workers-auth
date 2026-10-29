@@ -76,24 +76,6 @@ the real protection this would add.
 **Revisit when**: there's a concrete proposal for the production signal that
 doesn't rely on trusting client-controlled input.
 
-### Remove `sessionToUser()`'s `rateLimitId` → `userId` fallback
-
-**Where**: `src/middleware.ts` — `sessionToUser()`.
-
-**Why deferred**: the fallback exists to keep a pre-upgrade session (written
-before `AuthMeta.rateLimitId` existed) readable after this field was added.
-Now that both `AuthUser`-producing entry points fail closed on a missing
-`rateLimitId` (`verifyProviders()` and `createSessionFor()` — see the F6
-follow-up commit), the fallback's only remaining job is that migration
-compatibility; it can no longer also be masking a caller bug. `sessionToUser`
-returns the public, non-nullable `AuthUser` type, so it cannot itself express
-"this session predates the field" — narrowing that would be a bigger, separate
-type change. Not worth doing as a drive-by here.
-
-**Revisit when**: before publishing this package (a natural point at which no
-pre-upgrade session can exist yet, since there has been no prior release for
-one to have been written under).
-
 ## Not deferred — already implemented in Step 1.5
 
 For reference, since a review of this file benefits from not re-litigating what
@@ -111,3 +93,8 @@ Two of these were further revised in Step 1.5-b, after this list was written:
 `allowUnrevocableSessions: true` is set (rather than throwing only when
 `revokeAllForUser()` is called), and the JWT clock tolerance default moved
 from 60s to 30s. See SECURITY.md for both.
+
+Done before 1.0: `sessionToUser()`'s `rateLimitId` → `userId` fallback is
+gone. A session without `rateLimitId` is now refused by the cookie and bearer
+readers, and `sessionToUser()` returns `AuthUser | null` (breaking for callers
+that use it directly). See SECURITY.md, `AuthUser.rateLimitId`.

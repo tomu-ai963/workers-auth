@@ -151,21 +151,34 @@ export function getSession(c: Context): SessionInfo | null {
   return (c.get('authSession') as SessionInfo | null | undefined) ?? null;
 }
 
+function sessionAuthMeta(session: Session | SessionInfo): Record<string, unknown> {
+  const namespaced = (session.meta ?? {})[AUTH_META_KEY];
+  return typeof namespaced === 'object' && namespaced !== null ? (namespaced as Record<string, unknown>) : {};
+}
+
 /**
- * Rebuilds the subject from a session record.
+ * Whether a session carries the `rateLimitId` every authenticated subject
+ * must have. Only a session written by a pre-0.2.0 SDK (before the field
+ * existed) lacks it; such a session is treated as no session at all, so the
+ * caller signs in again rather than being handed a guessed value.
+ */
+export function hasRateLimitId(session: Session | SessionInfo): boolean {
+  const { rateLimitId } = sessionAuthMeta(session);
+  return typeof rateLimitId === 'string' && rateLimitId.length > 0;
+}
+
+/**
+ * Rebuilds the subject from a session record, or returns null for a session
+ * that has no `rateLimitId` (see {@link hasRateLimitId}).
  *
  * Only the SDK's own `meta.__auth` namespace is consulted. Application metadata
  * sitting next to it can never be promoted into an authenticated attribute,
  * however it happens to be named.
  */
-export function sessionToUser(session: Session | SessionInfo): AuthUser {
-  const namespaced = (session.meta ?? {})[AUTH_META_KEY];
-  const auth = (typeof namespaced === 'object' && namespaced !== null ? namespaced : {}) as {
-    email?: unknown;
-    provider?: unknown;
-    claims?: unknown;
-    rateLimitId?: unknown;
-  };
+export function sessionToUser(session: Session | SessionInfo): AuthUser | null {
+  const auth = sessionAuthMeta(session);
+  const { rateLimitId } = auth;
+  if (typeof rateLimitId !== 'string' || rateLimitId.length === 0) return null;
   const claims = (auth.claims && typeof auth.claims === 'object' ? auth.claims : {}) as Record<
     string,
     unknown
@@ -174,10 +187,7 @@ export function sessionToUser(session: Session | SessionInfo): AuthUser {
     id: session.userId,
     subjectType: session.subjectType,
     ...(typeof auth.email === 'string' ? { email: auth.email } : {}),
-    // Falls back to `userId` for a session written before `rateLimitId`
-    // existed in `meta.__auth` (a pre-upgrade session still live at deploy
-    // time) — never surfaces as missing, even though it wasn't provider-set.
-    rateLimitId: typeof auth.rateLimitId === 'string' && auth.rateLimitId ? auth.rateLimitId : session.userId,
+    rateLimitId,
     claims: {
       ...claims,
       ...(typeof auth.provider === 'string' ? { provider: auth.provider } : {}),
@@ -289,8 +299,12 @@ export async function readCookieSession(
   const found = sid ? await config.store.get(sid) : null;
   // A bearer session is only ever valid as `Authorization: Bearer` (see
   // `sessionBearer()`); presented as a cookie it is refused, mirroring the
-  // bearer provider's refusal of cookie sessions.
-  const session = found && !isBearerSession(found) && deviceCheckApplied(config.store, found) ? found : null;
+  // bearer provider's refusal of cookie sessions. A session with no
+  // rateLimitId (pre-0.2.0) is refused too — see `hasRateLimitId`.
+  const session =
+    found && !isBearerSession(found) && deviceCheckApplied(config.store, found) && hasRateLimitId(found)
+      ? found
+      : null;
   return { session, csrfCookie };
 }
 
@@ -328,8 +342,11 @@ export async function resolveRequestAuth(
   config: ResolvedAuthConfig,
 ): Promise<ResolvedRequestAuth> {
   const { session, csrfCookie } = await readCookieSession(c, config);
-  if (session) {
-    return { user: sessionToUser(session), session, csrfCookie };
+  // readCookieSession has already dropped a session with no rateLimitId, so
+  // the null branch is unreachable; it stays so a change there fails closed.
+  const sessionUser = session ? sessionToUser(session) : null;
+  if (session && sessionUser) {
+    return { user: sessionUser, session, csrfCookie };
   }
 
   const user = await verifyProviders(config.providers, c.req.raw, c.env, config.onEvent);
