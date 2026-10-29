@@ -6,6 +6,11 @@ none of them are required before Step 2 (command-kun integration). Revisit
 after Step 2 has surfaced real usage patterns, since several of these are
 easier to size correctly with a real caller in hand.
 
+**1.0 decision (2026-10-29)**: none of the four items below go into 1.0.
+`ctx.waitUntil` is planned for 1.x. It changes the `SessionStore` interface,
+so it ships as an addition that keeps existing stores working. The other three
+stay deferred until their "Revisit when" condition actually happens.
+
 ## Deferred: needs a design decision, not just an implementation
 
 ### Defer expensive KV deletes to `ctx.waitUntil`
@@ -25,6 +30,10 @@ session.
 
 **Revisit when**: Step 2 shows whether command-kun builds `createAuth` per
 request (has `ExecutionContext` handy) or once at module scope (doesn't).
+
+**Status (2026-10-29)**: Step 2 answered this. command-kun, personal-rag,
+pollenia and nonomono-shop all build `createAuth` per request, so an
+`ExecutionContext` is at hand. Planned for 1.x, not 1.0.
 
 ### `Sec-Fetch-Site: same-origin` fallback for browsers without `Origin` on same-origin requests
 
