@@ -6,6 +6,11 @@ none of them are required before Step 2 (command-kun integration). Revisit
 after Step 2 has surfaced real usage patterns, since several of these are
 easier to size correctly with a real caller in hand.
 
+**1.0 decision (2026-10-29)**: none of the four items below go into 1.0.
+`ctx.waitUntil` is planned for 1.x. It changes the `SessionStore` interface,
+so it ships as an addition that keeps existing stores working. The other three
+stay deferred until their "Revisit when" condition actually happens.
+
 ## Deferred: needs a design decision, not just an implementation
 
 ### Defer expensive KV deletes to `ctx.waitUntil`
@@ -25,6 +30,10 @@ session.
 
 **Revisit when**: Step 2 shows whether command-kun builds `createAuth` per
 request (has `ExecutionContext` handy) or once at module scope (doesn't).
+
+**Status (2026-10-29)**: Step 2 answered this. command-kun, personal-rag,
+pollenia and nonomono-shop all build `createAuth` per request, so an
+`ExecutionContext` is at hand. Planned for 1.x, not 1.0.
 
 ### `Sec-Fetch-Site: same-origin` fallback for browsers without `Origin` on same-origin requests
 
@@ -76,24 +85,6 @@ the real protection this would add.
 **Revisit when**: there's a concrete proposal for the production signal that
 doesn't rely on trusting client-controlled input.
 
-### Remove `sessionToUser()`'s `rateLimitId` → `userId` fallback
-
-**Where**: `src/middleware.ts` — `sessionToUser()`.
-
-**Why deferred**: the fallback exists to keep a pre-upgrade session (written
-before `AuthMeta.rateLimitId` existed) readable after this field was added.
-Now that both `AuthUser`-producing entry points fail closed on a missing
-`rateLimitId` (`verifyProviders()` and `createSessionFor()` — see the F6
-follow-up commit), the fallback's only remaining job is that migration
-compatibility; it can no longer also be masking a caller bug. `sessionToUser`
-returns the public, non-nullable `AuthUser` type, so it cannot itself express
-"this session predates the field" — narrowing that would be a bigger, separate
-type change. Not worth doing as a drive-by here.
-
-**Revisit when**: before publishing this package (a natural point at which no
-pre-upgrade session can exist yet, since there has been no prior release for
-one to have been written under).
-
 ## Not deferred — already implemented in Step 1.5
 
 For reference, since a review of this file benefits from not re-litigating what
@@ -111,3 +102,8 @@ Two of these were further revised in Step 1.5-b, after this list was written:
 `allowUnrevocableSessions: true` is set (rather than throwing only when
 `revokeAllForUser()` is called), and the JWT clock tolerance default moved
 from 60s to 30s. See SECURITY.md for both.
+
+Done before 1.0: `sessionToUser()`'s `rateLimitId` → `userId` fallback is
+gone. A session without `rateLimitId` is now refused by the cookie and bearer
+readers, and `sessionToUser()` returns `AuthUser | null` (breaking for callers
+that use it directly). See SECURITY.md, `AuthUser.rateLimitId`.
