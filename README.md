@@ -129,8 +129,9 @@ app.use('*', async (c, next) => {
 // fresh on every request. basePath: '/auth' above is what lets this sub-app
 // match the full incoming path (/auth/session, ...): app.route()'s automatic
 // prefix-stripping never runs on this path, since app.route() isn't used
-// here. No executionCtx argument is needed either — auth.routes() never
-// calls waitUntil.
+// here. No executionCtx argument is needed either: auth.routes() never
+// calls waitUntil itself, and a store given `executionCtx` (see "Deferring
+// expired-session cleanup") already holds this request's.
 app.all('/auth/*', (c) => c.get('auth').routes().fetch(c.req.raw, c.env));
 
 app.use('/api/*', (c, next) => c.get('auth').middleware()(c, next));
@@ -140,6 +141,10 @@ app.get('/api/me', (c) => c.json(getUser(c)));
 `createAuth` is called per request here because bindings only exist inside a
 request in Workers. It allocates nothing expensive: the JWKS cache lives at
 module scope and survives across requests inside the isolate.
+
+Because the store is built per request here, it can also take that request's
+`executionCtx`, which moves the cleanup of an expired session off the response
+path — see [Deferring expired-session cleanup](#deferring-expired-session-cleanup-executionctx).
 
 ### Module scope (bindings available outside a request)
 
@@ -155,6 +160,11 @@ Simpler, and **must not set `basePath`**: `app.route('/auth', auth.routes())`
 already strips the matched `/auth` prefix before delegating to the sub-app, so
 a sub-app that also expects that prefix baked in would need a request for
 `/auth/auth/session` to match anything.
+
+**Don't pass `executionCtx` to a store built here**: there is no request yet,
+and a context captured from the first one would be reused by every request
+after it. Leave it out; expired sessions are then cleaned up inline, as before
+1.1.
 
 ### What `auth.routes()` mounts
 
@@ -282,6 +292,65 @@ would silently un-revoke every session created before it — so cleanup keeps it
 around for `maxSessionLifetimeSec` (default 90 days; set it to the longest
 `absoluteTtlSec` you configure anywhere).
 
+### Deferring expired-session cleanup (`executionCtx`)
+
+When `get()` finds a session past its idle or absolute expiry, it returns
+`null` and deletes it: two `kv.delete()` calls for `kvSessionStore`, one
+`DELETE` for `d1SessionStore` and `pgSessionStore`. By default that delete is
+awaited, so the one request that happens to find the expired session pays for
+it. Give the store the request's `ExecutionContext` and the delete goes to
+`ctx.waitUntil()` instead:
+
+```ts
+store: kvSessionStore(c.env.KV, {
+  allowUnrevocableSessions: true,
+  executionCtx: executionCtxOf(c),
+}),
+// the same option on d1SessionStore(c.env.DB, { executionCtx: ... })
+// and pgSessionStore(executor, { executionCtx: ... })
+```
+
+- **The delete is issued at once; only the wait moves.** `get()` sends it
+  before returning and hands the pending promise to `waitUntil` — it is not
+  queued to start after the response.
+- **The answer does not change.** `get()` returns `null` in that request, and
+  a second request for the same `sid` that arrives before the delete lands
+  gets `null` too: expiry is read from the stored record, not from whether the
+  key or row is still there.
+- **A failed deferred delete is dropped silently.** Access was already decided,
+  and the leftover is expired data: KV's `expirationTtl` or the store's
+  `cleanup()` removes it later. It is not rethrown (nothing is left to receive
+  it) and not an unhandled rejection. Without `executionCtx` a failed delete
+  still rejects `get()`, as before.
+- **Only for a store built inside the request** — the per-request setup. See
+  [Module scope](#module-scope-bindings-available-outside-a-request) for why
+  not the other one. If `waitUntil` itself throws, `get()` falls back to
+  awaiting the delete.
+- **The option takes anything with `waitUntil(promise)`**
+  (`WaitUntilContext`): Hono's `c.executionCtx` as-is, or a plain object in
+  tests.
+
+Hono's `c.executionCtx` is a getter that **throws** when the request has no
+`ExecutionContext` — `app.request()` in tests, for one. Read it like this, so
+those requests just keep the awaited behaviour:
+
+```ts
+import type { Context } from 'hono';
+import type { WaitUntilContext } from '@tomu-ai/workers-auth';
+
+/** The request's ExecutionContext, or undefined where Hono has none (app.request() in tests). */
+export function executionCtxOf(c: Context): WaitUntilContext | undefined {
+  try {
+    return c.executionCtx;
+  } catch {
+    return undefined;
+  }
+}
+```
+
+With Postgres, see the note on closing the connection under
+[Postgres stores](#postgres-stores-storepg).
+
 ### Postgres stores (`./store/pg`)
 
 For apps whose data already lives in Postgres (Neon), so auth does not need a
@@ -371,6 +440,18 @@ const client = new Client({ connectionString: env.HYPERDRIVE_AUTH.connectionStri
 await client.connect();
 ctx.waitUntil(/* after the response */ client.end());
 ```
+
+With `pgSessionStore(executor, { executionCtx: ctx })` on this client, an
+expired session's `DELETE` is sent from inside `get()`, during the request —
+not started later from `waitUntil` — so it has the rest of the request to
+finish before `client.end()` above runs. That makes the race with the close
+unlikely, not impossible: `pg` (8.x, not pipelined) **destroys the socket** if
+`end()` is called while a query is still running, and a driver whose `end()`
+takes a timeout (postgres.js `sql.end({ timeout: 5 })`) cuts it off once that
+expires. A `DELETE` lost that way is swallowed like any other deferred delete,
+and the row stays until `cleanup()` — the session was already answered `null`
+and stays `null`. Neon over HTTP has no connection to close, so none of this
+applies there.
 
 Both adapters are the ones the test suite uses (the Neon one against a local
 Neon HTTP proxy, the `pg` one for the row-lock tests).

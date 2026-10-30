@@ -8,7 +8,8 @@ easier to size correctly with a real caller in hand.
 
 **1.0 decision (2026-10-29)**: none of the four items below go into 1.0.
 `ctx.waitUntil` is planned for 1.x. It changes the `SessionStore` interface,
-so it ships as an addition that keeps existing stores working. The other three
+so it ships as an addition that keeps existing stores working (as implemented
+for 1.1 it leaves `SessionStore` unchanged — see that item's Status). The other three
 stay deferred until their "Revisit when" condition actually happens.
 
 ## Deferred: needs a design decision, not just an implementation
@@ -34,6 +35,19 @@ request (has `ExecutionContext` handy) or once at module scope (doesn't).
 **Status (2026-10-29)**: Step 2 answered this. command-kun, personal-rag,
 pollenia and nonomono-shop all build `createAuth` per request, so an
 `ExecutionContext` is at hand. Planned for 1.x, not 1.0.
+
+**Status (2026-10-30)**: implemented on `feat/session-store-wait-until` for
+1.1, as option (b): `kvSessionStore`, `d1SessionStore` and `pgSessionStore`
+take an optional `executionCtx: { waitUntil(promise) }` at construction.
+`SessionStore` is unchanged, so existing callers and third-party stores keep
+working as they are. With it, `get()` issues the expired-session delete at
+once and hands the pending promise to `waitUntil` instead of awaiting it; a
+deferred failure is swallowed (access was already decided from the stored
+expiry). Without it, the delete is awaited as before. (a) was rejected for one
+more reason than the one above: `sessionBearer()` calls `store.get()` from
+`AuthProvider.verify(req, env)`, which has no context to pass, so (a) would
+have changed `AuthProvider` too. See README, "Deferring expired-session
+cleanup".
 
 ### `Sec-Fetch-Site: same-origin` fallback for browsers without `Origin` on same-origin requests
 
