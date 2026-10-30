@@ -11,7 +11,8 @@ import { env } from 'cloudflare:test';
 import { d1DeviceAuthStore, type D1DeviceAuthStoreOptions } from '../../src/device-auth/store.js';
 import { d1SessionStore } from '../../src/store/d1.js';
 import { pgDeviceAuthStore, pgSessionStore, type PgExecutor, type PgQueryResult } from '../../src/store/pg/index.js';
-import type { Clock } from '../../src/types.js';
+import type { Clock, WaitUntilContext } from '../../src/types.js';
+import { deleteGate } from './defer.js';
 
 export type Backend = 'd1' | 'pg';
 export const BACKEND: Backend = env.TEST_BACKEND === 'pg' ? 'pg' : 'd1';
@@ -64,10 +65,42 @@ export function neonExecutor(): PgExecutor {
   };
 }
 
-export function makeSessionStore(options: { clock?: Clock; executor?: PgExecutor } = {}) {
+export function makeSessionStore(
+  options: { clock?: Clock; executor?: PgExecutor; db?: D1Database; executionCtx?: WaitUntilContext } = {},
+) {
+  const { clock, executionCtx } = options;
   return BACKEND === 'pg'
-    ? pgSessionStore(options.executor ?? neonExecutor(), { clock: options.clock })
-    : d1SessionStore(env.DB, { clock: options.clock });
+    ? pgSessionStore(options.executor ?? neonExecutor(), { clock, executionCtx })
+    : d1SessionStore(options.db ?? env.DB, { clock, executionCtx });
+}
+
+/**
+ * A session store whose `DELETE` statements wait on the returned gate (see
+ * `deleteGate()`); every other statement runs straight through.
+ */
+export function gatedSessionStore(options: { clock?: Clock; executionCtx?: WaitUntilContext } = {}) {
+  const gate = deleteGate();
+  const isDelete = (text: string) => /^\s*DELETE\b/i.test(text);
+  if (BACKEND === 'pg') {
+    const inner = neonExecutor();
+    const executor: PgExecutor = {
+      query: (text, params) => (isDelete(text) ? gate.hold(() => inner.query(text, params)) : inner.query(text, params)),
+      transaction: (statements) => inner.transaction(statements),
+    };
+    return { gate, store: makeSessionStore({ ...options, executor }) };
+  }
+  const real = env.DB;
+  const db = {
+    prepare(query: string) {
+      const stmt = real.prepare(query);
+      if (!isDelete(query)) return stmt;
+      return {
+        bind: (...args: unknown[]) => ({ run: () => gate.hold(() => stmt.bind(...args).run()) }),
+      };
+    },
+    batch: (statements: D1PreparedStatement[]) => real.batch(statements),
+  } as unknown as D1Database;
+  return { gate, store: makeSessionStore({ ...options, db }) };
 }
 
 export function makeDeviceStore(options: D1DeviceAuthStoreOptions & { executor?: PgExecutor } = {}) {

@@ -8,7 +8,16 @@
  */
 
 import { randomToken, sha256Hex } from '../crypto.js';
-import type { Clock, NewSession, RevocationList, Session, SessionStore, SubjectType } from '../types.js';
+import type {
+  Clock,
+  NewSession,
+  RevocationList,
+  Session,
+  SessionStore,
+  SubjectType,
+  WaitUntilContext,
+} from '../types.js';
+import { settle } from './defer.js';
 import { assertIdentifier } from './revocation.js';
 
 export { revocationList, assertIdentifier } from './revocation.js';
@@ -31,6 +40,14 @@ export type D1SessionStoreOptions = {
    * actually reading the same `RevocationList` instance.
    */
   revocation?: RevocationList;
+  /**
+   * When set, `get()` hands its `DELETE` of an expired row to
+   * `executionCtx.waitUntil()` instead of awaiting it on the request path.
+   * The statement is still issued immediately; only the wait moves, and the
+   * session is `null` either way. Pass this only to a store built for the
+   * current request. Without it, `get()` awaits the `DELETE` as before.
+   */
+  executionCtx?: WaitUntilContext;
   clock?: Clock;
 };
 
@@ -80,6 +97,7 @@ export function d1SessionStore(db: D1Database, options: D1SessionStoreOptions = 
   const table = assertIdentifier(options.table ?? 'auth_sessions', 'd1SessionStore.table');
   const revocation = options.revocation;
   const now: Clock = options.clock ?? Date.now;
+  const executionCtx = options.executionCtx;
 
   async function readRow(sidHash: string): Promise<Row | null> {
     return db.prepare(`SELECT * FROM ${table} WHERE sid_hash = ?1`).bind(sidHash).first<Row>();
@@ -149,7 +167,7 @@ export function d1SessionStore(db: D1Database, options: D1SessionStoreOptions = 
 
       const at = now();
       if (at >= row.idle_expires_at || at >= row.absolute_expires_at) {
-        await db.prepare(`DELETE FROM ${table} WHERE sid_hash = ?1`).bind(sidHash).run();
+        await settle(executionCtx, db.prepare(`DELETE FROM ${table} WHERE sid_hash = ?1`).bind(sidHash).run());
         return null;
       }
       return rowToSession(row, sid);

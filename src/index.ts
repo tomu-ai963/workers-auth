@@ -219,6 +219,7 @@ export type {
   SessionScope,
   SessionStore,
   SubjectType,
+  WaitUntilContext,
 } from './types.js';
 
 export {

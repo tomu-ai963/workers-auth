@@ -20,7 +20,16 @@
  */
 
 import { randomToken, sha256Hex } from '../crypto.js';
-import type { Clock, NewSession, RevocationList, Session, SessionStore, SubjectType } from '../types.js';
+import type {
+  Clock,
+  NewSession,
+  RevocationList,
+  Session,
+  SessionStore,
+  SubjectType,
+  WaitUntilContext,
+} from '../types.js';
+import { settle } from './defer.js';
 
 export type KvSessionStoreOptions = {
   /** Key prefix for session records. Default: `sess:`. */
@@ -57,6 +66,16 @@ export type KvSessionStoreOptions = {
    * Default: 10.
    */
   touchThrottleSec?: number;
+  /**
+   * When set, `get()` hands its cleanup of an expired session (two
+   * `kv.delete()` calls) to `executionCtx.waitUntil()` instead of awaiting it
+   * on the request path. The deletes are still issued immediately; only the
+   * wait moves. The session is `null` either way — expiry is read from the
+   * record, not from whether the key is gone. Pass this only to a store built
+   * for the current request (see README, "Deferring expired-session cleanup").
+   * Without it, `get()` awaits the deletes as before.
+   */
+  executionCtx?: WaitUntilContext;
   clock?: Clock;
 };
 
@@ -117,6 +136,7 @@ export function kvSessionStore(kv: KVNamespace, options: KvSessionStoreOptions =
   const tombstoneFallbackMs = (options.tombstoneFallbackSec ?? 60 * 60 * 24 * 30) * 1000;
   const touchThrottleMs = (options.touchThrottleSec ?? 10) * 1000;
   const now: Clock = options.clock ?? Date.now;
+  const executionCtx = options.executionCtx;
 
   const sessionKey = (sidHash: string) => `${prefix}${sidHash}`;
   const seenKey = (sidHash: string) => `${seenPrefix}${sidHash}`;
@@ -181,7 +201,7 @@ export function kvSessionStore(kv: KVNamespace, options: KvSessionStoreOptions =
 
       const at = now();
       if (at >= record.absoluteExpiresAt) {
-        await forget(sidHash);
+        await settle(executionCtx, forget(sidHash));
         return null;
       }
 
@@ -191,7 +211,7 @@ export function kvSessionStore(kv: KVNamespace, options: KvSessionStoreOptions =
       const derivedIdleExpiry = record.createdAt + record.idleTtlSec * 1000;
       const idleExpiresAt = Math.min(seen?.e ?? derivedIdleExpiry, record.absoluteExpiresAt);
       if (at >= idleExpiresAt) {
-        await forget(sidHash);
+        await settle(executionCtx, forget(sidHash));
         return null;
       }
 

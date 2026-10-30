@@ -1,10 +1,11 @@
 import { env } from 'cloudflare:test';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { sha256Hex } from '../src/crypto.js';
 import { kvSessionStore } from '../src/store/kv.js';
 import { revocationList } from '../src/store/revocation.js';
-import type { SessionStore } from '../src/types.js';
+import type { SessionStore, WaitUntilContext } from '../src/types.js';
+import { deleteGate, fakeExecutionCtx, issued, tracked } from './helpers/defer.js';
 import { resetStorage } from './helpers/reset.js';
 
 const HOUR = 60 * 60;
@@ -380,5 +381,114 @@ describe('kvSessionStore: single-session revocation list', () => {
 
     now += 2 * DAY * 1000;
     expect(await revocation.cleanup()).toBe(1);
+  });
+});
+
+describe('kvSessionStore: executionCtx defers expired-session cleanup', () => {
+  /** A store over `env.KV` whose deletes wait on the returned gate. */
+  function gatedStore(executionCtx?: WaitUntilContext) {
+    const gate = deleteGate();
+    const kv = {
+      get: (...a: unknown[]) => (env.KV.get as (...x: unknown[]) => unknown)(...a),
+      put: (...a: unknown[]) => (env.KV.put as (...x: unknown[]) => unknown)(...a),
+      list: (...a: unknown[]) => (env.KV.list as (...x: unknown[]) => unknown)(...a),
+      delete: (key: string) => gate.hold(() => env.KV.delete(key)),
+    } as unknown as KVNamespace;
+    const store = kvSessionStore(kv, { clock, allowUnrevocableSessions: true, touchThrottleSec: 0, executionCtx });
+    return { gate, store };
+  }
+
+  const recordOf = async (sid: string) => env.KV.get(`sess:${await sha256Hex(sid)}`);
+  const settles = (t: { settled: boolean }) => vi.waitFor(() => expect(t.settled).toBe(true), { timeout: 2_000 });
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  it('issues both deletes, hands them to waitUntil, and returns null without waiting for them', async () => {
+    const ctx = fakeExecutionCtx();
+    const { gate, store } = gatedStore(ctx);
+    const created = await store.create(NEW_SESSION);
+    now = created.idleExpiresAt;
+
+    const get = tracked(store.get(created.sid));
+    await settles(get);
+    expect(await get.promise).toBeNull();
+    // Issued already, not queued to start later; still pending, so the record is still there.
+    expect(gate.issued).toBe(2);
+    expect(ctx.promises).toHaveLength(1);
+    expect(await recordOf(created.sid)).not.toBeNull();
+
+    gate.release();
+    await Promise.all(ctx.promises);
+    expect(await recordOf(created.sid)).toBeNull();
+  });
+
+  it('keeps answering null for the same sid while the deferred delete is still pending', async () => {
+    const ctx = fakeExecutionCtx();
+    const { gate, store } = gatedStore(ctx);
+    const created = await store.create(NEW_SESSION);
+    now = created.absoluteExpiresAt;
+
+    expect(await store.get(created.sid)).toBeNull();
+    expect(await recordOf(created.sid)).not.toBeNull();
+    expect(await store.get(created.sid)).toBeNull();
+    expect(ctx.promises).toHaveLength(2);
+    gate.release();
+    await Promise.all(ctx.promises);
+  });
+
+  it('without executionCtx, awaits the deletes before returning (unchanged)', async () => {
+    const { gate, store } = gatedStore();
+    const created = await store.create(NEW_SESSION);
+    now = created.idleExpiresAt;
+
+    const get = tracked(store.get(created.sid));
+    await issued(gate, 2);
+    await tick();
+    expect(get.settled).toBe(false);
+
+    gate.release();
+    expect(await get.promise).toBeNull();
+    expect(await recordOf(created.sid)).toBeNull();
+  });
+
+  it('a failing deferred delete neither rejects nor changes the answer', async () => {
+    const ctx = fakeExecutionCtx();
+    const { gate, store } = gatedStore(ctx);
+    const created = await store.create(NEW_SESSION);
+    gate.fail = true;
+    gate.release();
+    now = created.idleExpiresAt;
+
+    expect(await store.get(created.sid)).toBeNull();
+    expect(ctx.promises).toHaveLength(1);
+    await expect(ctx.promises[0]).resolves.toBeUndefined();
+  });
+
+  it('without executionCtx, a failing delete still rejects get() (unchanged)', async () => {
+    const { gate, store } = gatedStore();
+    const created = await store.create(NEW_SESSION);
+    gate.fail = true;
+    gate.release();
+    now = created.idleExpiresAt;
+
+    await expect(store.get(created.sid)).rejects.toThrow('injected: cleanup delete fails');
+  });
+
+  it('awaits the deletes itself when waitUntil throws', async () => {
+    const { gate, store } = gatedStore({
+      waitUntil() {
+        throw new Error('context already finished');
+      },
+    });
+    const created = await store.create(NEW_SESSION);
+    now = created.idleExpiresAt;
+
+    const get = tracked(store.get(created.sid));
+    await issued(gate, 2);
+    await tick();
+    expect(get.settled).toBe(false);
+
+    gate.release();
+    expect(await get.promise).toBeNull();
+    expect(await recordOf(created.sid)).toBeNull();
   });
 });

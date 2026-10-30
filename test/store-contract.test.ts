@@ -8,11 +8,19 @@
  * calls. The row-lock interleavings that need two held-open connections are in
  * test/pg-node/locks.test.ts.
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { CredentialRecord, DeviceAuthStore, DeviceAuthStoreCleanup, DeviceRecord } from '../src/device-auth/store.js';
 import type { SessionStore } from '../src/types.js';
-import { BACKEND, db, failDeviceRevocation, makeDeviceStore, makeSessionStore } from './helpers/backend.js';
+import {
+  BACKEND,
+  db,
+  failDeviceRevocation,
+  gatedSessionStore,
+  makeDeviceStore,
+  makeSessionStore,
+} from './helpers/backend.js';
+import { fakeExecutionCtx, issued, tracked } from './helpers/defer.js';
 import { HEAVY_TIMEOUT } from './helpers/device.js';
 import { resetStorage } from './helpers/reset.js';
 
@@ -435,3 +443,64 @@ function sessionContract(name: string, make: (clock: () => number) => CleanableS
 
 storeContract(BACKEND, () => makeDeviceStore({ clock: () => NOW }));
 sessionContract(BACKEND, (clock) => makeSessionStore({ clock }) as CleanableSessionStore);
+
+describe(`SessionStore executionCtx: deferred expired-session cleanup (${BACKEND})`, { timeout: HEAVY_TIMEOUT }, () => {
+  const input = { userId: 'u1', subjectType: 'user' as const, idleTtlSec: 60, absoluteTtlSec: 3600 };
+  const rows = () => db.prepare('SELECT COUNT(*) AS n FROM auth_sessions').first('n');
+  // Generous: on pg every read before the DELETE is an HTTP round trip.
+  const settles = (t: { settled: boolean }) => vi.waitFor(() => expect(t.settled).toBe(true), { timeout: 20_000 });
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 50));
+
+  it('issues the DELETE, hands it to waitUntil, and returns null without waiting for it', async () => {
+    let now = NOW;
+    const ctx = fakeExecutionCtx();
+    const { gate, store } = gatedSessionStore({ clock: () => now, executionCtx: ctx });
+    const a = await store.create(input);
+    now = NOW + 60_000;
+
+    const get = tracked(store.get(a.sid));
+    await settles(get);
+    expect(await get.promise).toBeNull();
+    expect(gate.issued).toBe(1);
+    expect(ctx.promises).toHaveLength(1);
+    expect(await rows()).toBe(1);
+
+    // Still pending: the same sid is refused again from the stored expiry alone.
+    expect(await store.get(a.sid)).toBeNull();
+
+    gate.release();
+    await Promise.all(ctx.promises);
+    expect(await rows()).toBe(0);
+  });
+
+  it('without executionCtx, awaits the DELETE before returning (unchanged)', async () => {
+    let now = NOW;
+    const { gate, store } = gatedSessionStore({ clock: () => now });
+    const a = await store.create(input);
+    now = NOW + 60_000;
+
+    const get = tracked(store.get(a.sid));
+    await issued(gate, 1);
+    await tick();
+    expect(get.settled).toBe(false);
+
+    gate.release();
+    expect(await get.promise).toBeNull();
+    expect(await rows()).toBe(0);
+  });
+
+  it('a failing deferred DELETE neither rejects nor changes the answer', async () => {
+    let now = NOW;
+    const ctx = fakeExecutionCtx();
+    const { gate, store } = gatedSessionStore({ clock: () => now, executionCtx: ctx });
+    const a = await store.create(input);
+    gate.fail = true;
+    gate.release();
+    now = NOW + 60_000;
+
+    expect(await store.get(a.sid)).toBeNull();
+    expect(ctx.promises).toHaveLength(1);
+    await expect(ctx.promises[0]).resolves.toBeUndefined();
+    expect(await rows()).toBe(1);
+  });
+});

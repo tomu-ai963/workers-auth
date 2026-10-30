@@ -10,7 +10,8 @@
  */
 
 import { randomToken, sha256Hex } from '../../crypto.js';
-import type { Clock, NewSession, Session, SessionStore, SubjectType } from '../../types.js';
+import type { Clock, NewSession, Session, SessionStore, SubjectType, WaitUntilContext } from '../../types.js';
+import { settle } from '../defer.js';
 import { affected, assertExecutor, assertPgIdentifier, num, retrying, type PgExecutor } from './executor.js';
 
 export type PgSessionStoreOptions = {
@@ -19,6 +20,16 @@ export type PgSessionStoreOptions = {
    * `^[a-z_][a-z0-9_]{0,62}$`; anything else throws here.
    */
   schema?: string;
+  /**
+   * When set, `get()` hands its `DELETE` of an expired row to
+   * `executionCtx.waitUntil()` instead of awaiting it on the request path.
+   * The statement is still issued immediately — before an app's own
+   * `waitUntil(client.end())` can close the connection — and only the wait
+   * moves; the session is `null` either way. A delete that still loses to the
+   * close is dropped and left for `cleanup()`. Pass this only to a store built
+   * for the current request. Without it, `get()` awaits the `DELETE` as before.
+   */
+  executionCtx?: WaitUntilContext;
   clock?: Clock;
 };
 
@@ -70,6 +81,7 @@ export function pgSessionStore(executor: PgExecutor, options: PgSessionStoreOpti
   const schema = assertPgIdentifier(options.schema === undefined ? 'public' : options.schema, 'pgSessionStore: schema');
   const table = `${schema}.auth_sessions`;
   const now: Clock = options.clock ?? Date.now;
+  const executionCtx = options.executionCtx;
 
   return {
     canRevokeAllForUser: true,
@@ -125,7 +137,7 @@ export function pgSessionStore(executor: PgExecutor, options: PgSessionStoreOpti
       if (!row) return null;
       const at = now();
       if (at >= num(row.idle_expires_at) || at >= num(row.absolute_expires_at)) {
-        await db.query(`DELETE FROM ${table} WHERE sid_hash = $1`, [sidHash]);
+        await settle(executionCtx, db.query(`DELETE FROM ${table} WHERE sid_hash = $1`, [sidHash]));
         return null;
       }
       return rowToSession(row, sid);

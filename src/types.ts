@@ -96,6 +96,13 @@ export interface SessionStore {
   touch(sid: string, idleExpiresAt: number): Promise<void>;
 }
 
+/**
+ * The one part of a Workers `ExecutionContext` (Hono's `c.executionCtx`) the
+ * built-in session stores use. Structural on purpose: a real
+ * `ExecutionContext` satisfies it as-is, and a test can pass a plain object.
+ */
+export type WaitUntilContext = { waitUntil(promise: Promise<unknown>): void };
+
 /** Everything needed to decide whether a session has been revoked. */
 export type RevocationQuery = {
   /** `sha256(sid)` hex. Raw session ids never reach the revocation list. */
