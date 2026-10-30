@@ -23,7 +23,7 @@ npm install @tomu-ai/workers-auth hono
 ```
 
 Not on the npm registry yet: install from a Git tag
-(`npm install github:tomu-ai963/workers-auth#v1.0.0 hono`). `dist/` is not
+(`npm install github:tomu-ai963/workers-auth#v1.1.0 hono`). `dist/` is not
 committed; the `prepare` script builds it during a Git install. Tags before
 `v0.3.1` have no `prepare` script and install without `dist/`, so their
 imports fail.
