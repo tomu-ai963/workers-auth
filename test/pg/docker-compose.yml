@@ -11,8 +11,11 @@
 # HTTP proxy authenticates clients against the role's stored password, so the
 # server cannot simply run with `trust`.
 #
-# Ports avoid personal-rag (55433/55444) and nonomono-shop (55432/54444), and
-# the 54662-55161 range Windows reserves on this machine (netsh excludedportrange).
+# Host ports default to 55436/55446, clear of personal-rag (55433/55444) and
+# nonomono-shop (55432/54444). Windows reserves port ranges that move across
+# reboots (netsh int ipv4 show excludedportrange protocol=tcp); when a default
+# lands in one, start with WA_TEST_PG_PORT / WA_TEST_PG_HTTP_PORT set:
+# `pnpm pg:up` checks the ports, then records them in test/pg/.env for vitest.
 name: workers-auth-test
 
 services:
@@ -33,7 +36,7 @@ services:
     # password after start, since initdb hashes it at the default.
     command: ['postgres', '-c', 'max_connections=200', '-c', 'fsync=off', '-c', 'scram_iterations=1']
     ports:
-      - '127.0.0.1:55436:5432'
+      - '127.0.0.1:${WA_TEST_PG_PORT:-55436}:5432'
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U postgres -d workers_auth_test']
       interval: 2s
@@ -47,7 +50,7 @@ services:
     environment:
       PG_CONNECTION_STRING: postgres://postgres:${WA_TEST_PG_PASSWORD:?run pnpm pg:up}@db:5432/workers_auth_test
     ports:
-      - '127.0.0.1:55446:4444'
+      - '127.0.0.1:${WA_TEST_PG_HTTP_PORT:-55446}:4444'
     depends_on:
       db:
         condition: service_healthy

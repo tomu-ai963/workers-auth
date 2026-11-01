@@ -1399,6 +1399,17 @@ against Postgres through `@neondatabase/serverless` and the local proxy) and
 which an HTTP driver cannot do). Without `pnpm pg:up` the pg projects fail with
 a message saying so; they never skip.
 
+`pnpm pg:up` binds 127.0.0.1:55436 (Postgres) and 127.0.0.1:55446 (the HTTP
+proxy). If either is taken, or falls in a range Windows has reserved
+(`netsh int ipv4 show excludedportrange protocol=tcp`; the ranges move across
+reboots), it stops before starting anything and says which. Choose other ports
+for `pg:up` only — they are recorded in `test/pg/.env`, so the test commands
+need nothing extra:
+
+```bash
+WA_TEST_PG_PORT=56436 WA_TEST_PG_HTTP_PORT=56446 pnpm pg:up
+```
+
 `pnpm test:neon` runs the same Postgres suites against a real Neon project
 instead, reading a direct (non-pooler) connection string from
 `test/pg/.env.neon` (`NEON_TEST_DATABASE_URL=...`, gitignored). Only that

@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { parseEnv } from 'node:util';
 
 import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-pool-workers';
 import { defineConfig } from 'vitest/config';
@@ -12,17 +13,22 @@ const pgMigrations = readdirSync(root('./migrations/pg'))
   .sort()
   .map((name) => ({ name, sql: readFileSync(root(`./migrations/pg/${name}`), 'utf8') }));
 
-// test/pg/.env is written by `pnpm pg:up` (random password, gitignored). Without
-// it PG_URL stays empty and every test in the pg projects fails with a message
-// saying so — they are never skipped.
+// test/pg/.env is written by `pnpm pg:up` (random password and the host ports it
+// started on, gitignored). Without it PG_URL stays empty and every test in the
+// pg projects fails with a message saying so — they are never skipped. The file
+// is read directly rather than through process.env so that it, not whatever the
+// shell has set now, decides where the running containers are.
+let pgEnv: Record<string, string | undefined> = {};
 try {
-  process.loadEnvFile(root('./test/pg/.env'));
+  pgEnv = parseEnv(readFileSync(root('./test/pg/.env'), 'utf8'));
 } catch {
   // not started
 }
-const pgPassword = process.env['WA_TEST_PG_PASSWORD'];
-const PG_URL = pgPassword ? `postgres://postgres:${pgPassword}@127.0.0.1:55436/workers_auth_test` : '';
-const PG_HTTP_ENDPOINT = 'http://127.0.0.1:55446/sql';
+const pgPassword = pgEnv['WA_TEST_PG_PASSWORD'];
+const pgPort = pgEnv['WA_TEST_PG_PORT'] || '55436';
+const pgHttpPort = pgEnv['WA_TEST_PG_HTTP_PORT'] || '55446';
+const PG_URL = pgPassword ? `postgres://postgres:${pgPassword}@127.0.0.1:${pgPort}/workers_auth_test` : '';
+const PG_HTTP_ENDPOINT = `http://127.0.0.1:${pgHttpPort}/sql`;
 
 // Real Neon (test project) — only when scripts/test-neon.mjs set WA_TEST_TARGET,
 // after its guard passed. The URL arrives in the environment, never from a file
