@@ -88,14 +88,14 @@
     "hono": ">=4.0.0"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.21.3",
+    "@cloudflare/vitest-pool-workers": "^0.23.0",
     "@cloudflare/workers-types": "^4.20250109.0",
     "@neondatabase/serverless": "1.2.0",
     "@types/pg": "^8.23.1",
-    "hono": "^4.6.0",
+    "hono": "^4.13.18",
     "pg": "8.23.1",
     "tsup": "^8.3.0",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.0"
+    "vitest": "^4.1.12"
   }
 }
